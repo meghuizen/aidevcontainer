@@ -17,7 +17,7 @@ cat <<'EOF'
 ai-dev container ready.
 
 On-demand services:
-  bash scripts/start-mssql.sh                # SQL Server 2025  -> 1433 (pw in ~/.mssql-password)
+  bash scripts/start-mssql.sh                # SQL Server 2025  -> mssql,1433 (separate container; pw in ~/.mssql-password)
   bash scripts/start-postgres.sh             # PostgreSQL 18    -> 5432
   bash scripts/start-azurite.sh              # Azurite          -> 10000/10001/10002
   bash scripts/start-azp-agent.sh            # Azure DevOps agent (needs AZP_URL / AZP_TOKEN)

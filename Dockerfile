@@ -639,13 +639,26 @@ RUN mkdir -p /opt/gh-runner \
 # Grammar sources only (not compiled), ~20 MB each. Trimmed from 11 languages to
 # the ones this image's stack actually uses; `tree-sitter-cli` can clone any other
 # grammar on demand. Override with --build-arg TREE_SITTER_GRAMMARS="a b c".
-RUN mkdir -p /opt/tree-sitter-grammars \
- && for g in ${TREE_SITTER_GRAMMARS}; do \
-        git clone --depth=1 "https://github.com/tree-sitter/tree-sitter-${g}.git" \
+#
+# Not every grammar lives under the tree-sitter org — `sql` and `yaml` do not
+# exist there (the old hardcoded list silently skipped both). Owners are mapped
+# per grammar, and a requested grammar that fails to clone now FAILS the build
+# instead of quietly leaving the image one grammar short.
+RUN set -eu; \
+    mkdir -p /opt/tree-sitter-grammars; \
+    for g in ${TREE_SITTER_GRAMMARS}; do \
+        case "$g" in \
+            sql)  owner=DerekStride ;; \
+            yaml) owner=tree-sitter-grammars ;; \
+            *)    owner=tree-sitter ;; \
+        esac; \
+        echo "tree-sitter: cloning ${owner}/tree-sitter-${g}"; \
+        git clone --depth=1 "https://github.com/${owner}/tree-sitter-${g}.git" \
             "/opt/tree-sitter-grammars/tree-sitter-${g}" \
-            2>/dev/null || echo "skip ${g}"; \
-    done \
- && rm -rf /opt/tree-sitter-grammars/*/.git
+          || { echo "tree-sitter: FAILED to clone ${owner}/tree-sitter-${g}" >&2; exit 1; }; \
+    done; \
+    rm -rf /opt/tree-sitter-grammars/*/.git; \
+    echo "tree-sitter: $(find /opt/tree-sitter-grammars -maxdepth 1 -mindepth 1 -type d | wc -l) grammars installed"
 
 RUN git clone --depth=1 https://github.com/ast-grep/awesome-rules.git /opt/ast-grep/rules || true \
  && rm -rf /opt/ast-grep/rules/.git
@@ -688,17 +701,18 @@ RUN chmod +x /usr/local/bin/aidev-entrypoint
 # Two separate mechanisms, both needed:
 #
 #  a) limits.d — pam_limits, which only runs for *login-ish* sessions (`su`,
-#     `sudo -i`, ssh). It is what raises limits for the DB servers we start via
-#     `sudo -u postgres` / `sudo -u mssql`.
+#     `sudo -i`, ssh). It is what raises limits for Postgres, which we start via
+#     `sudo -u postgres`.
 #  b) profile.d — raises each interactive shell's SOFT limit to its HARD limit.
 #     A `docker exec` does not go through PAM, so it inherits whatever the
 #     container was created with; the hard ceiling itself comes from the Docker
 #     daemon, i.e. the `ulimits:` block in .devcontainer/docker-compose.yml.
 #
 # nofile is the one that actually bites: pnpm/node watchers, Roslyn, and
-# ripgrep all burn file descriptors fast. memlock matters for SQL Server's
-# locked pages and for io_uring. core=0 stops multi-GB core dumps from .NET or
-# Chromium filling the container's writable layer.
+# ripgrep all burn file descriptors fast. memlock matters for io_uring (the SQL
+# Server engine that used to need it now runs in its own container, with its own
+# ulimits). core=0 stops multi-GB core dumps from .NET or Chromium filling the
+# container's writable layer.
 #-----------------------------------------------------------------------------
 # Values must match the compose `ulimits:` block — the container ceiling always
 # wins, so a larger number here would just be a lie. `*` does not cover root in
@@ -760,6 +774,11 @@ EOF
 COPY scripts /opt/aidev/scripts
 COPY tests   /opt/aidev/tests
 COPY config  /opt/aidev/config
+# start-mssql.sh and stop-all.sh drive `docker compose` for the SQL Server
+# service, so the baked copies at /opt/aidev need the compose file at the same
+# relative path they expect. Without this they only work from a bind-mounted
+# checkout, not from a plain `docker run`.
+COPY .devcontainer/docker-compose.yml /opt/aidev/.devcontainer/docker-compose.yml
 RUN chmod +x /opt/aidev/scripts/*.sh /opt/aidev/tests/*.sh
 
 # Pre-create vscode home subdirs and pre-warm analyzer caches in one pass.

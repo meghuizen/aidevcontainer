@@ -139,32 +139,45 @@ docker compose -f .devcontainer/docker-compose.yml --profile mssql up -d mssql
 sqlcmd -S mssql,1433 -U sa -P "$(cat ~/.mssql-password)" -No
 ```
 
-Port 1433 is still published to the host, so host-side tools (SSMS, Azure Data Studio) reach it at `localhost,1433` as before. Set `MSSQL_HOST` to override the hostname the scripts use.
+Port 1433 is published on **loopback only** (`127.0.0.1:1433:1433`), so host tools (SSMS, Azure Data Studio) reach it at `localhost,1433` while nothing on your network can. A bare `1433:1433` would publish on `0.0.0.0` and expose an `sa`-authenticated engine to the whole LAN.
 
 > **Never run a bare `docker compose up` from inside the dev container.** Compose resolves the dev service's relative bind mount (`../:/workspaces/aidevcontainer`) against the compose file's directory — an in-container path — and would hand that to the host daemon, producing a dev container with an empty workspace. Always name the service (`up -d mssql`), which is what `start-mssql.sh` and `stop-all.sh` do, or run compose from the host.
 
 The old `config/mssql.conf` is gone; the equivalent settings are `MSSQL_*` environment variables on the service (`MSSQL_MEMORY_LIMIT_MB`, `MSSQL_TCP_PORT`, `MSSQL_LCID`, `MSSQL_PID`). One setting did not survive the move: `customerfeedback = false`. The official container image has no documented environment variable for it, so telemetry is at the image's default.
 
-The SA password comes from `MSSQL_SA_PASSWORD` in the environment (the script exports it from `~/.mssql-password`) and is baked into the container at creation. Changing it later means `docker compose -f .devcontainer/docker-compose.yml rm -f mssql` and starting again — the `mssql-data` volume survives that, so your databases do too. Starting the service by hand without that variable set makes the SQL Server image refuse to start; check `docker compose logs mssql`.
+**The SA password.** `start-mssql.sh` generates one into `~/.mssql-password` (mode 600) on first run and exports it as `MSSQL_SA_PASSWORD`. SQL Server applies that variable **during first-time setup only** — after that the credential lives in `master.mdf`, and changing the environment variable does nothing except make compose recreate the container. So:
 
-**Existing data carries over.** The volume is still `aidev_mssql-data`, the same name the in-image server used, so databases created before this change are picked up by the new container with no migration.
+- To *recover* the password when a container already exists, just run `start-mssql.sh`: it reads the value back out of the container with `docker inspect` and rewrites `~/.mssql-password` to match.
+- To *change* it, do it in the engine: `sqlcmd -S mssql,1433 -U sa -P "$(cat ~/.mssql-password)" -No -Q "ALTER LOGIN sa WITH PASSWORD='<new-password>'"`, then write the same value into `~/.mssql-password`.
+- To start over completely, `docker compose -p aidev -f .devcontainer/docker-compose.yml down -v` from the **host** (wipes the data volume) and delete `~/.mssql-password`.
+
+Starting the service by hand with no `MSSQL_SA_PASSWORD` in the environment makes the image refuse to start — check `docker compose logs mssql`.
+
+**Pre-existing data needs a one-time chown.** The volume name is unchanged (`aidev_mssql-data`), but the data is not directly reusable: the old in-image server ran as an apt-created system `mssql` user with a dynamically assigned uid, while `mcr.microsoft.com/mssql/server` runs as uid **10001**. Without fixing ownership the engine exits at startup with permission errors on `master.mdf`. From the host, once:
+
+```bash
+docker run --rm -v aidev_mssql-data:/v busybox chown -R 10001:0 /v
+```
+
+If you have no databases worth keeping, `down -v` is simpler.
 
 **Postgres cluster creation.** The image sets `create_main_cluster = false` in `/etc/postgresql-common/createcluster.conf`, so `postgresql-18`'s postinst does **not** create a cluster during the build. `start-postgres.sh` runs `initdb` itself on first start and installs `config/postgresql.conf` + `config/pg_hba.conf` into the data dir, which is what it starts postgres with (`-c config_file=$PG_DATA/postgresql.conf`). Without this, the auto-created cluster would leave a populated data dir, the script would skip its init branch, the repo's configs would never be installed, and postgres would fail on a missing `config_file`.
 
 ## Forwarded ports
 
-`1433` (SQL), `5432` (PG), `10000-10002` (Azurite), `7071` (Azure Functions).
+`5432` (PG), `10000-10002` (Azurite), `7071` (Azure Functions) — forwarded from the dev container.
+
+SQL Server is the exception: it is not in the dev container, so `devcontainer.json` uses the compose-service form `"mssql:1433"`. The `mssql` service also publishes `127.0.0.1:1433` itself, so host tools work either way.
 
 ## SQL Server credentials
 
-A random 24-char SA password is generated on first run of `start-mssql.sh` and written to `~/.mssql-password` (mode 600). The DB data itself persists on the `mssql-data` volume across container recreates. Retrieve the password and connect:
+A 26-character SA password (22 random + a fixed `Aa1!` suffix, which guarantees SQL Server's four required character classes) is generated on first run of `start-mssql.sh` and written to `~/.mssql-password`, mode 600. From inside the dev container:
 
 ```bash
-cat ~/.mssql-password
-sqlcmd -S localhost,1433 -U sa -P "$(cat ~/.mssql-password)" -No -Q "SELECT @@VERSION"
+sqlcmd -S mssql,1433 -U sa -P "$(cat ~/.mssql-password)" -No -Q "SELECT @@VERSION"
 ```
 
-> **Caveat:** `~/.mssql-password` itself is not on a named volume in the default compose, so it survives container *runs* but is regenerated on `down -v`. The actual DB password baked into SQL Server lives in `mssql-data`; if you lose `~/.mssql-password` after first-run init, run `down -v` to wipe both, or copy the file out before recreating the container.
+Password recovery, rotation and the one-time chown for pre-existing data are all covered in [the SQL Server section above](#sql-server-runs-in-its-own-container) — that is the authoritative description. Note that `~/.mssql-password` lives in the dev container's home, which is not a named volume, so recreating the dev container loses the file; `start-mssql.sh` reads it back from the running SQL Server container, so this is recoverable rather than fatal.
 
 ## Azure DevOps build agent
 
@@ -241,7 +254,7 @@ rtk gain          # token savings analytics
 
 - **Tool caches** (`~/.cache/uv`, `~/.nuget`, `~/.npm`, `~/.cache/pnpm`, `~/.cache/huggingface`, `~/.azure`, `~/.claude`) live on **named Docker volumes** (ext4 inside the WSL2 VM on Windows) — much faster than NTFS bind mounts for many small files.
 - **DB data** persists on named volumes (`mssql-data` → `/var/opt/mssql`, `pg-data` → `/var/lib/postgresql/18/main`).
-- **`/tmp`** is a 4 GB tmpfs. **`/dev/shm`** is 2 GB (the 64 MB default crashes Chromium and upsets SQL Server).
+- **`/tmp`** is a 4 GB tmpfs. **`/dev/shm`** is 2 GB (the 64 MB default crashes Chromium under Playwright). The `mssql` service sets its own 1 GB.
 - **amd64v3 packages.** Ubuntu 26.10 publishes a second binary set built for x86-64-v3 (AVX2, FMA, BMI1/BMI2, MOVBE). The image enables it with `APT::Architecture-Variants "amd64v3"`, which covers nearly all of `main` and `universe`; apt falls back to plain amd64 for anything without a v3 build. Requires Intel Haswell / AMD Excavator or newer. Check your CPU with `ld.so --help | grep x86-64-v`.
 - **Runtime env tuning.** `DOTNET_EnableWriteXorExecute=0` (faster .NET startup), `DOTNET_TieredPGO=1`, `DOTNET_CLI_USE_MSBUILD_SERVER=1` (warm MSBuild workers), `MALLOC_ARENA_MAX=8` (was 2 — less allocator contention), `NODE_OPTIONS=--max-old-space-size=8192`, `UV_THREADPOOL_SIZE=16`, `UV_COMPILE_BYTECODE=1` (pre-compiled `.pyc` on install).
 - **Build-time tuning.** dpkg `force-unsafe-io` (no fsync per unpacked file — safe for a throwaway build FS), `Acquire::Languages "none"` (skips translation indexes), apt retries.
@@ -256,10 +269,10 @@ Set in three places, because they do different jobs. All three carry the same nu
 | Where | What it does |
 |---|---|
 | `.devcontainer/docker-compose.yml` → `ulimits:` | The **hard ceiling** the container is created with. Nothing inside the image can raise it. `nofile` 1,048,576 · `nproc` 262,144 · `memlock` unlimited · `stack` soft 8 MB / hard 64 MB · `core` 0 |
-| `/etc/security/limits.d/90-aidev.conf` (in image) | Applied by `pam_limits` for login-style sessions — this is what the DB servers get when started via `sudo -u postgres` / `sudo -u mssql`. |
+| `/etc/security/limits.d/90-aidev.conf` (in image) | Applied by `pam_limits` for login-style sessions — this is what Postgres gets when started via `sudo -u postgres`. |
 | `/etc/profile.d/10-aidev-limits.sh` (in image) | Raises each interactive shell's **soft** limit up to its hard limit. `docker exec` bypasses PAM, so without this a shell keeps the default soft `nofile`. |
 
-`core 0` stops multi-GB core dumps from .NET or Chromium filling the container's writable layer. `memlock` unlimited is needed for SQL Server locked pages and io_uring. `stack` deliberately keeps its **soft** limit at the glibc default of 8 MB — glibc uses the soft `RLIMIT_STACK` as the default pthread stack size, so raising it would make every thread reserve 64 MB of address space; only the hard ceiling is raised, so `ulimit -s` can be bumped for a process that genuinely needs it.
+`core 0` stops multi-GB core dumps from .NET or Chromium filling the container's writable layer. `memlock` unlimited is needed for io_uring; the SQL Server engine that also wanted it now runs in its own container with its own `ulimits`. `stack` deliberately keeps its **soft** limit at the glibc default of 8 MB — glibc uses the soft `RLIMIT_STACK` as the default pthread stack size, so raising it would make every thread reserve 64 MB of address space; only the hard ceiling is raised, so `ulimit -s` can be bumped for a process that genuinely needs it.
 
 Kernel tunables split by whether they can be namespaced:
 
@@ -271,7 +284,8 @@ Kernel tunables split by whether they can be namespaced:
 - **Build fails at the `apt install` step on a slow link.** `fetch-timeout` is already raised; if you still see ECONNRESET, retry the build — BuildKit cache resumes from the last successful layer.
 - **`docker run` from inside the container fails (permission denied on /var/run/docker.sock).** The `fix-docker-perms` entrypoint aligns the docker group GID; if it didn't run, `sudo /usr/local/bin/fix-docker-perms` re-runs it.
 - **Slow file ops on Windows.** Workspace is bind-mounted from NTFS — that's the bottleneck for many small files. Move tool caches to named volumes (already configured) and prefer running build commands inside the container shell, not from Windows.
-- **`sqlcmd` can't reach the server / "Login failed for user 'sa'".** Two usual causes. First, connect to `mssql,1433`, not `localhost,1433` — the engine is a separate container. Second, `~/.mssql-password` must match the password baked into the running container; if you regenerated the file, run `docker compose -f .devcontainer/docker-compose.yml rm -f mssql` and `start-mssql.sh` again (your data volume survives).
+- **`sqlcmd` can't reach the server / "Login failed for user 'sa'".** From inside the dev container connect to `mssql,1433`, not `localhost,1433` — the engine is a separate container. For password mismatches, re-run `start-mssql.sh`: it reads the password back out of the running container. See the [SQL Server section](#sql-server-runs-in-its-own-container) for the full picture.
+- **`mssql` does not resolve from the dev container.** The two containers must be in the same compose project. `start-mssql.sh` passes `-p aidev` explicitly and checks resolution before waiting, but if you started SQL Server by hand with a different project name (or have `COMPOSE_PROJECT_NAME` exported), you get a separate network and an empty data volume. Check with `docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$(hostname)"`.
 - **`start-mssql.sh` says it cannot reach the Docker daemon.** It drives compose over the mounted socket, so `/var/run/docker.sock` has to be mounted and the `vscode` user has to be in the `docker` group — run `sudo /usr/local/bin/fix-docker-perms` if the entrypoint didn't.
 - **Microsoft's apt repo is pinned to `noble` (24.04), not 26.04.** Deliberate, and it is the only option: the `ubuntu/26.04/prod` feed (suite `resolute`) exists but contains 218 packages of moby/Kubernetes/Defender/sysinternals tooling — no `mssql-tools18`, no `msodbcsql18`, no `powershell`, no .NET. The `noble` debs install cleanly on 26.10 because their dependencies (`libc6`, `libstdc++6`, `libkrb5-3`, `openssl`, `unixodbc`, `odbcinst`) all exist there. Verify before "upgrading" it: `curl -s https://packages.microsoft.com/ubuntu/26.04/prod/dists/resolute/main/binary-amd64/Packages | grep '^Package:' | sort -u`.
 - **No GPU detected.** Run `bash scripts/gpu-check.sh`. Confirm `nvidia-container-toolkit` is installed on the host and the compose GPU block is uncommented.
@@ -286,7 +300,7 @@ Kernel tunables split by whether they can be namespaced:
 
 ### Measured: apt packages — 3.43 GiB
 
-Full dependency closure of the 86 explicitly installed packages (598 packages total), summing `Installed-Size` from the Ubuntu 26.10, Microsoft, and Azure CLI indexes. Excludes `docker-ce-cli` + `docker-compose-plugin` (~130 MB, not in the indexes checked).
+Full dependency closure of the explicitly installed apt packages — **598 packages resolved** — summing `Installed-Size` from the Ubuntu 26.10, Microsoft and Azure CLI indexes. Excluded because they are not in those indexes: `docker-ce-cli` and `docker-compose-plugin` (~130 MB, Docker's own repo), the NodeSource `nodejs` package, and `mssql-tools18`/`msodbcsql18` (~25 MB — Microsoft's index omits `Installed-Size` entirely). Add roughly 200 MB for those.
 
 Removing `mssql-server`, `libicu-dev` and `libopenblas-dev` took this from **5.00 GiB to 3.43 GiB — 1.57 GiB saved, 18 fewer packages**, with `mssql-tools18`, `msodbcsql18`, `unixodbc`, `odbcinst` and `libicu78` all still present.
 
@@ -324,7 +338,7 @@ Removed, for reference: `mssql-server` was **1451 MiB** — the largest single i
 | `/opt/venv` Python stack | ~450 MiB | Wheels total ~75 MiB, installed 1.5–2.5× plus transitive deps |
 | Azure CLI extensions | ~300 MiB | 5 extensions incl. `aks-preview` |
 | uv-managed Python 3.11 + 3.14 | ~250 MiB | Two standalone builds |
-| tree-sitter grammars (10 clones) | ~200 MiB | Source only, not compiled |
+| tree-sitter grammars (6 clones) | ~100 MiB | Source only, not compiled. Was 11 clones / ~200 MiB |
 | Standalone binaries | ~100 MiB | duckdb 20, rust-analyzer 14, lazygit, delta, yt-dlp, rtk |
 
 ### Already trimmed (~1.7 GB)
@@ -332,7 +346,7 @@ Removed, for reference: `mssql-server` was **1451 MiB** — the largest single i
 - **SQL Server engine → separate container** (−1451 MiB). The biggest single item, removed from an image you rebuild often. The client stack stays. See the SQL Server section above.
 - **`libopenblas-dev`** (−107 MiB). Only needed to *compile* against BLAS; NumPy/SciPy wheels bundle their own OpenBLAS.
 - **`libicu-dev`** (−50 MiB). Only needed to *compile* against ICU; `dotnet-runtime-10.0` depends on the runtime `libicu78`, which still comes in.
-- **tree-sitter grammars trimmed** from 11 languages to 6 (−~90 MiB). Controlled by the `TREE_SITTER_GRAMMARS` build arg; `tree-sitter-cli` clones any other grammar on demand.
+- **tree-sitter grammars trimmed** from 11 languages to 6, so 5 fewer clones at ~20 MB each (−~100 MiB). Controlled by the `TREE_SITTER_GRAMMARS` build arg; `tree-sitter-cli` clones any other grammar on demand.
 
 ### Still available
 

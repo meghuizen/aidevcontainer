@@ -147,9 +147,10 @@ check "py docx/openpyxl/pdf*"   /opt/venv/bin/python -c "import docx, pptx, open
 
 if [[ "${AIDEV_SMOKE_FULL:-0}" == "1" ]]; then
   echo "--- Services (full mode) ---"
+  echo "note: the first run pulls mcr.microsoft.com/mssql/server (~700 MB) — not hung"
   # Starts the `mssql` compose service; connect by service name, not localhost.
   bash scripts/start-mssql.sh
-  check "sqlcmd connect"        bash -c '/opt/mssql-tools18/bin/sqlcmd -S "${MSSQL_HOST:-mssql},1433" -U sa -P "$(cat ~/.mssql-password)" -No -Q "SELECT @@VERSION"'
+  check "sqlcmd connect"        bash -c '/opt/mssql-tools18/bin/sqlcmd -S mssql,1433 -U sa -P "$(cat ~/.mssql-password)" -No -Q "SELECT @@VERSION"'
 
   bash scripts/start-postgres.sh
   check "psql connect"          bash -c 'psql -U postgres -h 127.0.0.1 -c "SELECT version();"'

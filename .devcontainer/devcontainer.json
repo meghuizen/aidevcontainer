@@ -8,9 +8,12 @@
   "containerEnv": {
     "TZ": "Europe/Amsterdam"
   },
-  "forwardPorts": [1433, 5432, 10000, 10001, 10002, 7071],
+  // "mssql:1433" is the compose-service form. A bare 1433 would be resolved
+  // against the dev container, where nothing listens any more — SQL Server runs
+  // as its own `mssql` service.
+  "forwardPorts": ["mssql:1433", 5432, 10000, 10001, 10002, 7071],
   "portsAttributes": {
-    "1433":  { "label": "SQL Server 2025" },
+    "mssql:1433":  { "label": "SQL Server 2025 (mssql service)" },
     "5432":  { "label": "PostgreSQL 18" },
     "10000": { "label": "Azurite Blob" },
     "10001": { "label": "Azurite Queue" },

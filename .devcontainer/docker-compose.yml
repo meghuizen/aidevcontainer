@@ -37,8 +37,8 @@ services:
     sysctls:
       net.core.somaxconn: "8192"
       net.ipv4.ip_local_port_range: "10240 65535"
-    # /dev/shm default is 64 MB, which Chromium (Playwright) and SQL Server both
-    # outgrow — Chromium crashes, SQL Server logs shared-memory errors.
+    # /dev/shm default is 64 MB, which Chromium (Playwright) outgrows — it crashes
+    # with "Target closed" / SIGBUS. The mssql service sets its own below.
     shm_size: "2gb"
     environment:
       TZ: Europe/Amsterdam
@@ -87,7 +87,11 @@ services:
     profiles: ["mssql"]
     image: mcr.microsoft.com/mssql/server:2025-latest
     hostname: mssql
-    restart: unless-stopped
+    # No restart policy on purpose. `profiles:` only controls what `up` selects —
+    # the daemon enforces restart independently, so `unless-stopped` would bring
+    # the 2 GB engine back on every host boot, which is what the profile exists
+    # to avoid.
+    restart: "no"
     environment:
       ACCEPT_EULA: "Y"
       MSSQL_PID: Developer
@@ -104,8 +108,15 @@ services:
       MSSQL_LCID: "1033"
       MSSQL_MEMORY_LIMIT_MB: "4096"
       TZ: Europe/Amsterdam
+    # Loopback-only. A bare "1433:1433" publishes on 0.0.0.0, which would put an
+    # sa-authenticated engine on every network this host is attached to. Host
+    # tools (SSMS, Azure Data Studio) still reach it at localhost,1433.
     ports:
-      - "1433:1433"
+      - "127.0.0.1:1433:1433"
+    # NOTE: this volume was previously written by the in-image apt SQL Server,
+    # which ran as a system `mssql` user with a dynamically assigned uid. This
+    # image runs as uid 10001, so pre-existing data needs a one-time chown —
+    # see the SQL Server section in README.md.
     volumes:
       - mssql-data:/var/opt/mssql
     # SQL Server on Linux wants a high fd ceiling and locked pages.
