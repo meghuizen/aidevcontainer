@@ -102,8 +102,10 @@ check "rsync"                   rsync --version
 echo "--- DBs (clients) ---"
 check "duckdb"                  duckdb --version
 check "psql 18"                 bash -c 'psql --version | grep -q "psql .* 18"'
-check "sqlcmd"                  bash -c '/opt/mssql-tools18/bin/sqlcmd -? 2>&1 | head -n1 | grep -i sqlcmd'
-check "bcp"                     test -x /opt/mssql-tools18/bin/bcp
+# Short names on purpose: /opt/mssql-tools18/bin is on PATH, and the docs tell
+# people to call `sqlcmd` directly, so the PATH entry is part of what's tested.
+check "sqlcmd (on PATH)"        bash -c 'sqlcmd -? 2>&1 | head -n1 | grep -i sqlcmd'
+check "bcp (on PATH)"           bash -c 'command -v bcp'
 check "odbc driver 18"          bash -c "odbcinst -q -d | grep -qi 'ODBC Driver 18 for SQL Server'"
 check "sqlite3"                 sqlite3 --version
 # The SQL Server ENGINE is not in this image — it runs as the `mssql` compose
@@ -150,7 +152,7 @@ if [[ "${AIDEV_SMOKE_FULL:-0}" == "1" ]]; then
   echo "note: the first run pulls mcr.microsoft.com/mssql/server (~700 MB) — not hung"
   # Starts the `mssql` compose service; connect by service name, not localhost.
   bash scripts/start-mssql.sh
-  check "sqlcmd connect"        bash -c '/opt/mssql-tools18/bin/sqlcmd -S mssql,1433 -U sa -P "$(cat ~/.mssql-password)" -No -Q "SELECT @@VERSION"'
+  check "sqlcmd connect"        bash -c 'SQLCMDPASSWORD="$(cat ~/.mssql-password)" sqlcmd -S mssql,1433 -U sa -No -Q "SELECT @@VERSION"'
 
   bash scripts/start-postgres.sh
   check "psql connect"          bash -c 'psql -U postgres -h 127.0.0.1 -c "SELECT version();"'

@@ -40,3 +40,29 @@ aidev_already_running() {
   fi
   return 1
 }
+
+# aidev_compose_project
+# Echoes the compose project this container belongs to. Prefers the container's
+# own label over assuming the compose file's `name:`, because devcontainer
+# tooling may create the stack under a different project — and a mismatched
+# project means a different network and a different (empty) data volume.
+# Memoized: each compose call would otherwise pay a `docker inspect` round trip.
+AIDEV_COMPOSE_PROJECT=""
+aidev_compose_project() {
+  if [[ -z "$AIDEV_COMPOSE_PROJECT" ]]; then
+    AIDEV_COMPOSE_PROJECT="$(docker inspect \
+        -f '{{index .Config.Labels "com.docker.compose.project"}}' \
+        "$(hostname)" 2>/dev/null || true)"
+    : "${AIDEV_COMPOSE_PROJECT:=aidev}"
+  fi
+  printf '%s' "$AIDEV_COMPOSE_PROJECT"
+}
+
+# aidev_compose <args...>
+# Runs docker compose against this repo's compose file in the right project.
+# Single definition so start-mssql.sh and stop-all.sh cannot drift apart.
+aidev_compose() {
+  local dir="${AIDEV_SCRIPT_DIR:?aidev_compose: set AIDEV_SCRIPT_DIR first}"
+  docker compose -p "$(aidev_compose_project)" \
+                 -f "$dir/../.devcontainer/docker-compose.yml" "$@"
+}

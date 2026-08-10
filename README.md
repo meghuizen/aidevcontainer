@@ -129,7 +129,7 @@ Heavy services do not auto-start. Launch them when you need them:
 
 The 1.45 GB engine is not baked into the dev image. `.devcontainer/docker-compose.yml` declares an `mssql` service using `mcr.microsoft.com/mssql/server:2025-latest`, behind the compose profile `mssql` so it does **not** start with the dev container (the engine wants ~2 GB of RAM).
 
-`bash scripts/start-mssql.sh` works exactly as before — it generates the SA password at `~/.mssql-password` on first run, brings the service up, and waits until the engine answers. It drives compose through the mounted Docker socket, so it works from inside the dev container or from the host. From the host directly:
+`bash scripts/start-mssql.sh` generates the SA password at `~/.mssql-password` on first run, brings the service up, and waits until the engine answers. It runs **inside the dev container only** — it drives compose through the mounted Docker socket and needs the bundled `sqlcmd`, so it exits with a message on the host. From the host, use compose directly:
 
 ```bash
 docker compose -f .devcontainer/docker-compose.yml --profile mssql up -d mssql
@@ -138,7 +138,7 @@ docker compose -f .devcontainer/docker-compose.yml --profile mssql up -d mssql
 **Connect to host `mssql`, not `localhost`** — the engine is a different container on the compose network:
 
 ```bash
-sqlcmd -S mssql,1433 -U sa -P "$(cat ~/.mssql-password)" -No
+SQLCMDPASSWORD="$(cat ~/.mssql-password)" sqlcmd -S mssql,1433 -U sa -No
 ```
 
 Port 1433 is published on **loopback only** (`127.0.0.1:1433:1433`), so host tools (SSMS, Azure Data Studio) reach it at `localhost,1433` while nothing on your network can. A bare `1433:1433` would publish on `0.0.0.0` and expose an `sa`-authenticated engine to the whole LAN.
@@ -147,13 +147,23 @@ Port 1433 is published on **loopback only** (`127.0.0.1:1433:1433`), so host too
 
 The old `config/mssql.conf` is gone; the equivalent settings are `MSSQL_*` environment variables on the service (`MSSQL_MEMORY_LIMIT_MB`, `MSSQL_TCP_PORT`, `MSSQL_LCID`, `MSSQL_PID`). One setting did not survive the move: `customerfeedback = false`. The official container image has no documented environment variable for it, so telemetry is at the image's default.
 
-**The SA password.** `start-mssql.sh` generates one into `~/.mssql-password` (mode 600) on first run and exports it as `MSSQL_SA_PASSWORD`. SQL Server applies that variable **during first-time setup only** — after that the credential lives in `master.mdf`, and changing the environment variable does nothing except make compose recreate the container. So:
+**The SA password.** `start-mssql.sh` generates a 26-character password on first run — 22 random characters plus a fixed `Aa1!` suffix, which guarantees SQL Server's four required character classes — and writes it to `~/.mssql-password`, mode 600, then exports it as `MSSQL_SA_PASSWORD`.
 
-- To *recover* the password when a container already exists, just run `start-mssql.sh`: it reads the value back out of the container with `docker inspect` and rewrites `~/.mssql-password` to match.
-- To *change* it, do it in the engine: `sqlcmd -S mssql,1433 -U sa -P "$(cat ~/.mssql-password)" -No -Q "ALTER LOGIN sa WITH PASSWORD='<new-password>'"`, then write the same value into `~/.mssql-password`.
-- To start over completely, `docker compose -p aidev -f .devcontainer/docker-compose.yml down -v` from the **host** (wipes the data volume) and delete `~/.mssql-password`.
+SQL Server applies that variable **during first-time setup only**. After that the credential lives in `master.mdf`, and changing the environment variable does nothing except make compose recreate the container, which leaves every login failing. So:
 
-Starting the service by hand with no `MSSQL_SA_PASSWORD` in the environment makes the image refuse to start — check `docker compose logs mssql`.
+- To *recover* the password when a container already exists, just run `start-mssql.sh`. It reads the value back out of the container with `docker inspect` and writes it to `~/.mssql-password` — but only if that file is missing or its password does not authenticate, so a password you rotated in-engine is never clobbered.
+- To *change* it, do it in the engine and then update the file:
+  ```bash
+  SQLCMDPASSWORD="$(cat ~/.mssql-password)" sqlcmd -S mssql,1433 -U sa -No \
+    -Q "ALTER LOGIN sa WITH PASSWORD='<new-password>'"
+  ```
+- To start over completely, `docker compose -f .devcontainer/docker-compose.yml down -v` from the **host** (wipes the data volume) and delete `~/.mssql-password`.
+
+`~/.mssql-password` lives in the dev container's home, which is not a named volume, so recreating the dev container loses it. That is recoverable rather than fatal — see the first bullet.
+
+Starting the service by hand with no `MSSQL_SA_PASSWORD` in the environment makes the image refuse to start; check `docker compose logs mssql`.
+
+Prefer `SQLCMDPASSWORD` over `sqlcmd -P` as shown above: `-P` puts the password in the process arguments, where anything running in the container can read it out of `/proc`.
 
 **Pre-existing data needs a one-time chown.** The volume name is unchanged (`aidev_mssql-data`), but the data is not directly reusable: the old in-image server ran as an apt-created system `mssql` user with a dynamically assigned uid, while `mcr.microsoft.com/mssql/server` runs as uid **10001**. Without fixing ownership the engine exits at startup with permission errors on `master.mdf`. From the host, once:
 
@@ -170,16 +180,6 @@ If you have no databases worth keeping, `down -v` is simpler.
 `5432` (PG), `10000-10002` (Azurite), `7071` (Azure Functions) — forwarded from the dev container.
 
 SQL Server is the exception: it is not in the dev container, so `devcontainer.json` uses the compose-service form `"mssql:1433"`. The `mssql` service also publishes `127.0.0.1:1433` itself, so host tools work either way.
-
-## SQL Server credentials
-
-A 26-character SA password (22 random + a fixed `Aa1!` suffix, which guarantees SQL Server's four required character classes) is generated on first run of `start-mssql.sh` and written to `~/.mssql-password`, mode 600. From inside the dev container:
-
-```bash
-sqlcmd -S mssql,1433 -U sa -P "$(cat ~/.mssql-password)" -No -Q "SELECT @@VERSION"
-```
-
-Password recovery, rotation and the one-time chown for pre-existing data are all covered in [the SQL Server section above](#sql-server-runs-in-its-own-container) — that is the authoritative description. Note that `~/.mssql-password` lives in the dev container's home, which is not a named volume, so recreating the dev container loses the file; `start-mssql.sh` reads it back from the running SQL Server container, so this is recoverable rather than fatal.
 
 ## Azure DevOps build agent
 

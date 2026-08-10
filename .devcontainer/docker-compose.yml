@@ -82,7 +82,7 @@ services:
   #
   # From the dev container, connect to host `mssql` (the service name), NOT
   # localhost — the engine is a separate container on the compose network:
-  #   sqlcmd -S mssql,1433 -U sa -P "$(cat ~/.mssql-password)" -No
+  #   SQLCMDPASSWORD="$(cat ~/.mssql-password)" sqlcmd -S mssql,1433 -U sa -No
   mssql:
     profiles: ["mssql"]
     image: mcr.microsoft.com/mssql/server:2025-latest
@@ -96,13 +96,17 @@ services:
       ACCEPT_EULA: "Y"
       MSSQL_PID: Developer
       # Supplied by scripts/start-mssql.sh, which generates it into
-      # ~/.mssql-password on first run and exports it. Left with an empty default
-      # rather than compose's required-variable form (`:?`), because compose
-      # interpolates the WHOLE file regardless of active profiles — a required
-      # variable here would break `up` for the dev service too. If it is empty the
-      # SQL Server image itself refuses to start with a clear message.
-      # Baked in at container creation: changing it later needs
-      # `docker compose rm -f mssql` (the data volume survives).
+      # ~/.mssql-password on first run and exports it.
+      #
+      # Applied by SQL Server during FIRST-TIME SETUP ONLY. After that the
+      # credential lives in master.mdf and this variable is ignored — recreating
+      # the container with a different value does not change the password, it just
+      # makes every login fail. README.md covers recovery and rotation.
+      #
+      # Empty default rather than compose's required-variable form (`:?`): compose
+      # interpolates the WHOLE file regardless of active profiles, so `:?` here
+      # would break `up` for the dev service too. If it is empty, the SQL Server
+      # image itself refuses to start with a clear message.
       MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:-}
       MSSQL_TCP_PORT: "1433"
       MSSQL_LCID: "1033"

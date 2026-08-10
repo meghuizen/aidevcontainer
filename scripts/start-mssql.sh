@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Start SQL Server 2025 as the `mssql` compose service, from inside the dev
-# container. The engine is NOT in this image (it was 1.45 GB of it) — it runs as a
-# separate container from mcr.microsoft.com/mssql/server.
+# Start SQL Server 2025 as the `mssql` compose service. Run this from INSIDE the
+# dev container. The engine is not in this image (it was 1.45 GB of it) — it runs
+# as a separate container from mcr.microsoft.com/mssql/server.
 #
 # From the host, run compose directly instead:
-#   docker compose -p aidev -f .devcontainer/docker-compose.yml --profile mssql up -d mssql
+#   docker compose -f .devcontainer/docker-compose.yml --profile mssql up -d mssql
 #
-# The compose call always names the `mssql` service. That matters in here:
+# The compose calls always name the `mssql` service. That matters in here:
 # compose resolves the dev service's relative bind mount
 # (`../:/workspaces/aidevcontainer`) against the compose file's directory, which
 # in this container is an in-container path. Acting on `dev` from inside would
@@ -20,13 +20,9 @@ source "$SCRIPT_DIR/_lib.sh"
 SQLCMD=/opt/mssql-tools18/bin/sqlcmd
 aidev_must_be_in_container "$SQLCMD"
 
-# Service name from the compose file == the DNS name on the compose network.
+# Service name from the compose file == its DNS name on the compose network.
 SQL_HOST=mssql
 PWFILE="${HOME}/.mssql-password"
-# -p is explicit: COMPOSE_PROJECT_NAME in the environment outranks the compose
-# file's `name:`, and a different project means a different network and a fresh
-# empty data volume.
-COMPOSE=(docker compose -p aidev -f "$SCRIPT_DIR/../.devcontainer/docker-compose.yml")
 
 docker info >/dev/null 2>&1 || {
   echo "error: cannot reach the Docker daemon." >&2
@@ -34,56 +30,138 @@ docker info >/dev/null 2>&1 || {
   echo "       group — try: sudo /usr/local/bin/fix-docker-perms" >&2
   exit 2; }
 
-# If a container already exists, its SA password was fixed at creation time and
-# is the only one the engine will accept: SQL Server applies MSSQL_SA_PASSWORD
-# during first-time setup only, then stores the credential in master.mdf. Adopt
-# it rather than passing a different value, which would make compose recreate the
-# container and leave every login failing.
-existing_pw="$("${COMPOSE[@]}" --profile mssql ps -aq mssql 2>/dev/null \
-  | head -n1 \
-  | xargs -r docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
-  | sed -n 's/^MSSQL_SA_PASSWORD=//p' | head -n1 || true)"
+# aidev_compose (in _lib.sh) targets this container's own compose project, so the
+# service lands on the network the dev container is actually attached to.
+AIDEV_SCRIPT_DIR="$SCRIPT_DIR"
+PROJECT="$(aidev_compose_project)"
 
-if [[ -n "${existing_pw:-}" ]]; then
-  if [[ ! -f "$PWFILE" ]] || [[ "$(cat "$PWFILE")" != "$existing_pw" ]]; then
-    umask 077
-    printf '%s' "$existing_pw" > "$PWFILE"
-    chmod 600 "$PWFILE"
-    echo "mssql: adopted the SA password from the existing container into $PWFILE"
-  fi
-elif [[ ! -f "$PWFILE" ]]; then
-  # First run. SQL Server requires upper, lower, digit, symbol and length >= 8;
-  # the fixed suffix guarantees all four character classes.
+# `sqlcmd` reads SQLCMDPASSWORD, so the password never appears in argv (the wait
+# loop below re-execs the probe up to 90 times — that would be 90 chances for any
+# process in this container to read it out of /proc).
+try_login() {
+  SQLCMDPASSWORD="$1" "$SQLCMD" -S "${SQL_HOST},1433" -U sa -No -Q "SELECT 1" \
+    >/dev/null 2>&1
+}
+save_password() {
   umask 077
-  printf '%s' "$(openssl rand -base64 24 | tr -d '\n=+/' | head -c 22)Aa1!" > "$PWFILE"
+  printf '%s' "$1" > "$PWFILE"
   chmod 600 "$PWFILE"
-  echo "mssql: generated SA password at $PWFILE"
+}
+
+#---------------------------------------------------------------------------
+# Work out which password to use.
+#
+# SQL Server applies MSSQL_SA_PASSWORD during first-time setup ONLY; afterwards
+# the credential lives in master.mdf and the environment variable is ignored. So
+# for an existing container the value baked into it at creation is the only one
+# compose may be given — passing anything else makes compose recreate the
+# container and leaves every login failing.
+#
+# But a password rotated in-engine (ALTER LOGIN) is newer than that baked value,
+# so ~/.mssql-password is never overwritten just because it differs. It is only
+# replaced when it is absent, or when it is proven not to work.
+#---------------------------------------------------------------------------
+# Captured into a variable first: a failing `ps` inside a process substitution
+# would leave CIDS empty and read as "no container", which is the one mistake that
+# leads to compose recreating the engine with a password it will then ignore.
+cids_raw="$(aidev_compose --profile mssql ps -aq mssql)" || {
+  echo "error: 'docker compose ps' failed — refusing to continue, because treating" >&2
+  echo "       this as 'no container exists' risks breaking sa login permanently." >&2
+  exit 1; }
+mapfile -t CIDS < <(printf '%s\n' "$cids_raw" | sed '/^$/d')
+if (( ${#CIDS[@]} > 1 )); then
+  echo "error: ${#CIDS[@]} mssql containers exist in compose project '$PROJECT'." >&2
+  echo "       Refusing to guess which one owns the data volume. Remove the extras:" >&2
+  printf '         docker rm -f %s\n' "${CIDS[@]}" >&2
+  exit 1
 fi
 
-MSSQL_SA_PASSWORD="$(cat "$PWFILE")"
+baked_pw=""
+if (( ${#CIDS[@]} == 1 )); then
+  # No error suppression here: a failed read must not look like "no container",
+  # which would send a freshly generated password to compose and trigger a
+  # recreate that permanently breaks sa login.
+  baked_pw="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "${CIDS[0]}" \
+              | sed -n 's/^MSSQL_SA_PASSWORD=//p' | head -n1)"
+  if [[ -z "$baked_pw" ]]; then
+    echo "error: container ${CIDS[0]} has no MSSQL_SA_PASSWORD in its config." >&2
+    echo "       Cannot recover the SA password. Recreate it with a known password:" >&2
+    echo "         docker rm -f ${CIDS[0]}   # the data volume survives" >&2
+    exit 1
+  fi
+fi
+
+file_pw=""
+[[ -f "$PWFILE" ]] && file_pw="$(cat "$PWFILE")"
+
+if [[ -z "$file_pw" && -z "$baked_pw" ]]; then
+  # Genuine first run. SQL Server wants upper, lower, digit, symbol, length >= 8;
+  # the fixed suffix guarantees all four classes.
+  file_pw="$(openssl rand -base64 24 | tr -d '\n=+/' | head -c 22)Aa1!"
+  save_password "$file_pw"
+  echo "mssql: generated SA password at $PWFILE"
+elif [[ -z "$file_pw" ]]; then
+  file_pw="$baked_pw"
+  save_password "$file_pw"
+  echo "mssql: recovered the SA password from the existing container into $PWFILE"
+fi
+
+#---------------------------------------------------------------------------
+# Already up?
+#---------------------------------------------------------------------------
+if try_login "$file_pw"; then
+  echo "mssql: already running"
+  exit 0
+fi
+if [[ -n "$baked_pw" && "$baked_pw" != "$file_pw" ]] && try_login "$baked_pw"; then
+  echo "mssql: already running (the container's password differs from $PWFILE — adopting it)"
+  save_password "$baked_pw"
+  exit 0
+fi
+
+#---------------------------------------------------------------------------
+# Start it.
+#---------------------------------------------------------------------------
+# For an existing container, hand compose the value already baked into it so the
+# config is unchanged and compose does not recreate it.
+MSSQL_SA_PASSWORD="${baked_pw:-$file_pw}"
 export MSSQL_SA_PASSWORD
 
-probe=("$SQLCMD" -S "${SQL_HOST},1433" -U sa -P "$MSSQL_SA_PASSWORD" -No -Q "SELECT 1")
-aidev_already_running mssql "${probe[@]}" && exit 0
+echo "mssql: starting the ${SQL_HOST} service in compose project '${PROJECT}'..."
+aidev_compose --profile mssql up -d mssql
 
-echo "mssql: starting the ${SQL_HOST} compose service..."
-"${COMPOSE[@]}" --profile mssql up -d mssql
-
-# Fail fast on the common misconfiguration (wrong compose project => the dev
-# container is not on the same network) instead of waiting out the full timeout.
-if ! getent hosts "$SQL_HOST" >/dev/null 2>&1; then
-  echo "error: '${SQL_HOST}' does not resolve from this container." >&2
-  echo "       The dev container and the mssql service must be in the same compose" >&2
-  echo "       project. Check COMPOSE_PROJECT_NAME is unset or 'aidev':" >&2
-  echo "         docker inspect -f '{{index .Config.Labels \"com.docker.compose.project\"}}' \"\$(hostname)\"" >&2
+dump_logs_and_die() {
+  echo "$1" >&2
+  aidev_compose --profile mssql logs --tail 40 mssql >&2 || true
   exit 1
+}
+
+# `up -d` returns once the container is *started*, not once it is alive. The two
+# documented crash causes — a data volume owned by the pre-migration uid, and an
+# empty MSSQL_SA_PASSWORD — both exit within seconds, so check liveness before
+# blaming anything else.
+cid="$(aidev_compose --profile mssql ps -aq mssql | head -n1)"
+if [[ -z "$cid" ]] \
+   || [[ "$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null)" != "true" ]]; then
+  dump_logs_and_die "mssql: the container is not running — logs follow"
+fi
+
+if ! getent hosts "$SQL_HOST" >/dev/null 2>&1; then
+  echo "error: '${SQL_HOST}' does not resolve from this container, although it is running." >&2
+  echo "       The dev container and the mssql service must share a compose network." >&2
+  echo "       This container's project is '${PROJECT}'; verify with:" >&2
+  echo "         docker inspect -f '{{index .Config.Labels \"com.docker.compose.project\"}}' \"\$(hostname)\"" >&2
+  dump_logs_and_die "mssql: logs follow"
 fi
 
 # A fresh data volume takes a while: the engine creates master/model/msdb.
-if ! aidev_wait_until mssql 90 2 "${probe[@]}"; then
-  echo "mssql: dumping container logs" >&2
-  "${COMPOSE[@]}" --profile mssql logs --tail 40 mssql >&2 || true
-  exit 1
+export SQLCMDPASSWORD="$MSSQL_SA_PASSWORD"
+if ! aidev_wait_until mssql 90 2 \
+      "$SQLCMD" -S "${SQL_HOST},1433" -U sa -No -Q "SELECT 1"; then
+  dump_logs_and_die "mssql: timed out waiting for the engine — logs follow"
 fi
+unset SQLCMDPASSWORD
 
-echo "mssql: connect with  sqlcmd -S ${SQL_HOST},1433 -U sa -P \"\$(cat $PWFILE)\" -No"
+[[ "$MSSQL_SA_PASSWORD" == "$file_pw" ]] || save_password "$MSSQL_SA_PASSWORD"
+echo "mssql: ready. Connect with:"
+echo "  SQLCMDPASSWORD=\"\$(cat $PWFILE)\" sqlcmd -S ${SQL_HOST},1433 -U sa -No"

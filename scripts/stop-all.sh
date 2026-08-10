@@ -3,13 +3,15 @@
 # doesn't short-circuit the rest of the cleanup.
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=_lib.sh
+source "$SCRIPT_DIR/_lib.sh"
+AIDEV_SCRIPT_DIR="$SCRIPT_DIR"
 
 # SQL Server runs as the `mssql` compose service, not a process in this container.
 # `stop` (not `down`) so the data volume and the container's baked-in SA password
 # survive. stderr is NOT silenced: a permission-denied socket must not read as
 # "stopped" while the engine keeps holding port 1433.
-docker compose -p aidev -f "$SCRIPT_DIR/../.devcontainer/docker-compose.yml" \
-    --profile mssql stop mssql \
+aidev_compose --profile mssql stop mssql \
     || echo "stop-all: WARNING — could not stop the mssql service (see error above)" >&2
 # start-postgres.sh starts via bare pg_ctl against /var/lib/postgresql/18/main, not the
 # Debian cluster registry, so pg_ctlcluster won't find it. Use pg_ctl with the matching dir.

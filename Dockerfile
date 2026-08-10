@@ -118,7 +118,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     DOTNET_CLI_USE_MSBUILD_SERVER=1 \
     NODE_OPTIONS=--max-old-space-size=8192 \
     UV_THREADPOOL_SIZE=16 \
-    PATH=/usr/local/dotnet-tools:/opt/uv-tools/bin:/opt/venv/bin:/home/vscode/.local/bin:/home/vscode/.local/share/pnpm:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/azp-agent:/opt/gh-runner
+    PATH=/usr/local/dotnet-tools:/opt/uv-tools/bin:/opt/venv/bin:/home/vscode/.local/bin:/home/vscode/.local/share/pnpm:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/mssql-tools18/bin:/opt/azp-agent:/opt/gh-runner
 
 #-----------------------------------------------------------------------------
 # 2. Bootstrap apt: build-speed tuning, amd64v3 opt-in, full upgrade, repo keys.
@@ -388,7 +388,7 @@ RUN if id -u vscode >/dev/null 2>&1; then \
 # login shells and `docker exec` alike. Do not restate ENV values here: this file
 # and the ENV block silently drifting apart is a real failure mode.
 COPY <<'EOF' /etc/profile.d/00-aidev-path.sh
-export PATH="/usr/local/dotnet-tools:/opt/uv-tools/bin:/opt/venv/bin:/home/vscode/.local/bin:${PNPM_HOME:-/home/vscode/.local/share/pnpm}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/azp-agent:/opt/gh-runner"
+export PATH="/usr/local/dotnet-tools:/opt/uv-tools/bin:/opt/venv/bin:/home/vscode/.local/bin:${PNPM_HOME:-/home/vscode/.local/share/pnpm}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/mssql-tools18/bin:/opt/azp-agent:/opt/gh-runner"
 EOF
 
 #-----------------------------------------------------------------------------
@@ -643,7 +643,9 @@ RUN mkdir -p /opt/gh-runner \
 # Not every grammar lives under the tree-sitter org — `sql` and `yaml` do not
 # exist there (the old hardcoded list silently skipped both). Owners are mapped
 # per grammar, and a requested grammar that fails to clone now FAILS the build
-# instead of quietly leaving the image one grammar short.
+# instead of quietly leaving the image one grammar short. Of the two mapped
+# owners only `sql` is in the default set; the `yaml` arm exists for
+# --build-arg overrides.
 RUN set -eu; \
     mkdir -p /opt/tree-sitter-grammars; \
     for g in ${TREE_SITTER_GRAMMARS}; do \
@@ -776,8 +778,10 @@ COPY tests   /opt/aidev/tests
 COPY config  /opt/aidev/config
 # start-mssql.sh and stop-all.sh drive `docker compose` for the SQL Server
 # service, so the baked copies at /opt/aidev need the compose file at the same
-# relative path they expect. Without this they only work from a bind-mounted
-# checkout, not from a plain `docker run`.
+# relative path they expect — otherwise they fail with "no configuration file"
+# whenever the repo is not bind-mounted. This makes stop-all.sh work in that case;
+# start-mssql.sh still needs the container to be part of the compose stack, since
+# a plain `docker run` container is not on the network where `mssql` resolves.
 COPY .devcontainer/docker-compose.yml /opt/aidev/.devcontainer/docker-compose.yml
 RUN chmod +x /opt/aidev/scripts/*.sh /opt/aidev/tests/*.sh
 
