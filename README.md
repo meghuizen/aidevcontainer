@@ -17,8 +17,8 @@ Single-image Ubuntu 26.10 (stonking) dev container that bundles the full AI / .N
 | **Node** | v26.6.0 pinned (NodeSource), **pnpm is the default package manager** (corepack-managed); npm and yarn also available. TypeScript, ts-language-server, tree-sitter-cli, Playwright CLI (browsers downloaded on demand with `playwright install`) |
 | **AI agents** | Claude Code (`@anthropic-ai/claude-code`), Codex (`@openai/codex`), OpenCode (`opencode-ai`), Hermes (NousResearch), Happy (happy.engineering — `happy`), **rtk** (Rust Token Killer) — all preinstalled |
 | **AI/ML runtime** | Hugging Face Hub client (`huggingface-cli`). CUDA Toolkit + cuDNN are NOT preinstalled (saved ~5 GB); torch / faster-whisper / whisper.cpp / Ollama removed (saved ~2.5 GB). Driver libs are injected at runtime by NVIDIA Container Toolkit when `--gpus all` is used. Install on demand inside the container — see GPU section below. |
-| **DBs (servers)** | SQL Server 2025 (Microsoft `noble` feed), PostgreSQL 18 (Ubuntu archive — single origin, no PGDG), DuckDB |
-| **DB clients** | sqlcmd (mssql-tools18), psql 18, sqlite3 |
+| **DBs (servers)** | PostgreSQL 18 (Ubuntu archive — single origin, no PGDG), DuckDB. **SQL Server 2025 runs as a separate `mssql` container**, not in this image — see below |
+| **DB clients** | sqlcmd + bcp (mssql-tools18), ODBC Driver 18 (msodbcsql18 + unixodbc), psql 18, sqlite3 |
 | **Search & nav** | ripgrep (`rg`), ast-grep (`sg`), tree-sitter, tree, fd, bat, fzf, zoxide, delta |
 | **Git** | git, git-lfs, git-extras, GitHub CLI (`gh`), tig, lazygit, pre-commit, `repo` (Android multi-repo tool — 26.10 dropped the apt package, so it comes from Google's official launcher script) |
 | **Archive / sync** | zip, unzip, xz-utils, zstd, rsync |
@@ -64,6 +64,7 @@ docker buildx build --progress=plain --tag aidev:latest --load . 2>&1 | Tee-Obje
 | `GH_RUNNER_VERSION` | `2.336.0` | GitHub Actions runner version |
 | `AZP_AGENT_VERSION` | `5.277.0` | Azure DevOps agent version |
 | `RTK_VERSION` | *(empty → latest)* | Pin RTK release tag |
+| `TREE_SITTER_GRAMMARS` | `c-sharp python typescript javascript bash sql` | Grammar sources to clone. Add any of `rust go yaml html css`, or set to `""` for none |
 
 ## Run via VS Code (recommended)
 
@@ -116,13 +117,35 @@ Heavy services do not auto-start. Launch them when you need them:
 
 | Command | Service | Default port(s) |
 |---|---|---|
-| `bash scripts/start-mssql.sh` | SQL Server 2025 | 1433 |
+| `bash scripts/start-mssql.sh` | SQL Server 2025 (separate container) | 1433 |
 | `bash scripts/start-postgres.sh` | PostgreSQL 18 | 5432 |
 | `bash scripts/start-azurite.sh` | Azurite (Blob/Queue/Table) | 10000 / 10001 / 10002 |
 | `bash scripts/start-azp-agent.sh` | Azure DevOps build agent | — |
 | `bash scripts/start-gh-runner.sh` | GitHub Actions runner | — |
 | `bash scripts/gpu-check.sh` | Report GPU presence | — |
 | `bash scripts/stop-all.sh` | Stop everything | — |
+
+**SQL Server runs in its own container.** The 1.45 GB engine is not baked into the dev image. `.devcontainer/docker-compose.yml` declares an `mssql` service using `mcr.microsoft.com/mssql/server:2025-latest`, behind the compose profile `mssql` so it does **not** start with the dev container (the engine wants ~2 GB of RAM).
+
+`bash scripts/start-mssql.sh` works exactly as before — it generates the SA password at `~/.mssql-password` on first run, brings the service up, and waits until the engine answers. It drives compose through the mounted Docker socket, so it works from inside the dev container or from the host. From the host directly:
+
+```bash
+docker compose -f .devcontainer/docker-compose.yml --profile mssql up -d mssql
+```
+
+**Connect to host `mssql`, not `localhost`** — the engine is a different container on the compose network:
+
+```bash
+sqlcmd -S mssql,1433 -U sa -P "$(cat ~/.mssql-password)" -No
+```
+
+Port 1433 is still published to the host, so host-side tools (SSMS, Azure Data Studio) reach it at `localhost,1433` as before. Set `MSSQL_HOST` to override the hostname the scripts use.
+
+The old `config/mssql.conf` is gone; the equivalent settings are `MSSQL_*` environment variables on the service (`MSSQL_MEMORY_LIMIT_MB`, `MSSQL_TCP_PORT`, `MSSQL_LCID`, `MSSQL_PID`). One setting did not survive the move: `customerfeedback = false`. The official container image has no documented environment variable for it, so telemetry is at the image's default.
+
+The SA password comes from `MSSQL_SA_PASSWORD` in the environment (the script exports it from `~/.mssql-password`) and is baked into the container at creation. Changing it later means `docker compose -f .devcontainer/docker-compose.yml rm -f mssql` and starting again — the `mssql-data` volume survives that, so your databases do too. Starting the service by hand without that variable set makes the SQL Server image refuse to start; check `docker compose logs mssql`.
+
+**Existing data carries over.** The volume is still `aidev_mssql-data`, the same name the in-image server used, so databases created before this change are picked up by the new container with no migration.
 
 **Postgres cluster creation.** The image sets `create_main_cluster = false` in `/etc/postgresql-common/createcluster.conf`, so `postgresql-18`'s postinst does **not** create a cluster during the build. `start-postgres.sh` runs `initdb` itself on first start and installs `config/postgresql.conf` + `config/pg_hba.conf` into the data dir, which is what it starts postgres with (`-c config_file=$PG_DATA/postgresql.conf`). Without this, the auto-created cluster would leave a populated data dir, the script would skip its init branch, the repo's configs would never be installed, and postgres would fail on a missing `config_file`.
 
@@ -246,7 +269,9 @@ Kernel tunables split by whether they can be namespaced:
 - **Build fails at the `apt install` step on a slow link.** `fetch-timeout` is already raised; if you still see ECONNRESET, retry the build — BuildKit cache resumes from the last successful layer.
 - **`docker run` from inside the container fails (permission denied on /var/run/docker.sock).** The `fix-docker-perms` entrypoint aligns the docker group GID; if it didn't run, `sudo /usr/local/bin/fix-docker-perms` re-runs it.
 - **Slow file ops on Windows.** Workspace is bind-mounted from NTFS — that's the bottleneck for many small files. Move tool caches to named volumes (already configured) and prefer running build commands inside the container shell, not from Windows.
-- **`mssql-conf` complains on first run.** Delete `~/.mssql-password` and let `start-mssql.sh` regenerate it (only safe on a fresh `mssql-data` volume).
+- **`sqlcmd` can't reach the server / "Login failed for user 'sa'".** Two usual causes. First, connect to `mssql,1433`, not `localhost,1433` — the engine is a separate container. Second, `~/.mssql-password` must match the password baked into the running container; if you regenerated the file, run `docker compose -f .devcontainer/docker-compose.yml rm -f mssql` and `start-mssql.sh` again (your data volume survives).
+- **`start-mssql.sh` says it cannot reach the Docker daemon.** It drives compose over the mounted socket, so `/var/run/docker.sock` has to be mounted and the `vscode` user has to be in the `docker` group — run `sudo /usr/local/bin/fix-docker-perms` if the entrypoint didn't.
+- **Microsoft's apt repo is pinned to `noble` (24.04), not 26.04.** Deliberate, and it is the only option: the `ubuntu/26.04/prod` feed (suite `resolute`) exists but contains 218 packages of moby/Kubernetes/Defender/sysinternals tooling — no `mssql-tools18`, no `msodbcsql18`, no `powershell`, no .NET. The `noble` debs install cleanly on 26.10 because their dependencies (`libc6`, `libstdc++6`, `libkrb5-3`, `openssl`, `unixodbc`, `odbcinst`) all exist there. Verify before "upgrading" it: `curl -s https://packages.microsoft.com/ubuntu/26.04/prod/dists/resolute/main/binary-amd64/Packages | grep '^Package:' | sort -u`.
 - **No GPU detected.** Run `bash scripts/gpu-check.sh`. Confirm `nvidia-container-toolkit` is installed on the host and the compose GPU block is uncommented.
 - **Hermes Playwright browser install hangs / fails.** The build spoofs `/etc/os-release` as Ubuntu 24.04 during Hermes install so Playwright accepts the host (its binary-host map has no `ubuntu26.10-x64` entry). After install, the file is restored.
 - **A program dies with "Illegal instruction" / SIGILL.** You are running the amd64v3 image on a CPU older than Intel Haswell / AMD Excavator. Rebuild with `--build-arg ENABLE_AMD64V3=0`.
@@ -255,29 +280,31 @@ Kernel tunables split by whether they can be namespaced:
 
 ## Image size
 
-**Roughly 11 GB.** The apt half is measured exactly; the rest is estimated. Nothing here has been confirmed against a built image yet — run `docker image ls aidev:latest` and the audit commands at the end of this section to replace these numbers with real ones.
+**Roughly 9 GB**, down from ~11 GB before the cuts described below. The apt half is measured exactly; the rest is estimated. Nothing here has been confirmed against a built image yet — run `docker image ls aidev:latest` and the audit commands at the end of this section to replace these numbers with real ones.
 
-### Measured: apt packages — 5.00 GiB
+### Measured: apt packages — 3.43 GiB
 
-Full dependency closure of the 91 explicitly installed packages (616 packages total), summing `Installed-Size` from the Ubuntu 26.10, Microsoft, and Azure CLI indexes. Excludes `docker-ce-cli` + `docker-compose-plugin` (~130 MB, not in the indexes checked).
+Full dependency closure of the 86 explicitly installed packages (598 packages total), summing `Installed-Size` from the Ubuntu 26.10, Microsoft, and Azure CLI indexes. Excludes `docker-ce-cli` + `docker-compose-plugin` (~130 MB, not in the indexes checked).
+
+Removing `mssql-server`, `libicu-dev` and `libopenblas-dev` took this from **5.00 GiB to 3.43 GiB — 1.57 GiB saved, 18 fewer packages**, with `mssql-tools18`, `msodbcsql18`, `unixodbc`, `odbcinst` and `libicu78` all still present.
 
 The "marginal cost" column is what you actually get back by removing something — the package plus the dependencies nothing else needs:
 
 | Component | Marginal cost | Notes |
 |---|---:|---|
-| `mssql-server` (+ `mssql-tools18`) | **1451 MiB** | Largest single item in the whole image |
 | `azure-cli` | **677 MiB** | apt build bundles its own Python and all deps |
-| `rust-all` | **632 MiB** | `rust-1.93-src` 194 + `libstd-rust-dev` 188 + LLVM 216 |
+| `rust-all` | **646 MiB** | `rust-1.93-src` 194 + `libstd-rust-dev` 188 + LLVM 216 |
 | `dotnet-sdk-10.0` | **537 MiB** | Plus runtime and targeting packs |
 | `golang-go` + `gopls` | 254 MiB | `golang-1.26-src` alone is 147 MiB |
 | `ffmpeg` | 215 MiB | Pulls the full codec library set |
-| `libopenblas-dev` | 107 MiB | |
 | `cmake` | 59 MiB | |
-| `libicu-dev` | 50 MiB | |
 | `vim` + `nano` + `tmux` + `tig` + `htop` | 50 MiB | |
-| `postgresql-18` + client | 26 MiB | Genuinely cheap |
+| `postgresql-18` + client | 32 MiB | Genuinely cheap |
 | `tesseract-ocr` + eng data | 21 MiB | |
+| `mssql-tools18` + `msodbcsql18` | ~1 MiB compressed | The client stack, kept. Microsoft's index omits `Installed-Size`, so this is **not** included in the 3.43 GiB above — add roughly 25 MB for it |
 | Playwright system libs | 4 MiB | The libs are nearly free; browsers are not |
+
+Removed, for reference: `mssql-server` was **1451 MiB** — the largest single item in the image. (`rust-all` and `postgresql-18` cost slightly more now that they no longer share dependencies with it.)
 
 ### Estimated: everything else — ~6 GB
 
@@ -298,22 +325,20 @@ The "marginal cost" column is what you actually get back by removing something �
 | tree-sitter grammars (10 clones) | ~200 MiB | Source only, not compiled |
 | Standalone binaries | ~100 MiB | duckdb 20, rust-analyzer 14, lazygit, delta, yt-dlp, rtk |
 
-### Trimming it
+### Already trimmed (~1.7 GB)
 
-**Free wins — no capability lost (~250 MB):**
+- **SQL Server engine → separate container** (−1451 MiB). The biggest single item, removed from an image you rebuild often. The client stack stays. See the SQL Server section above.
+- **`libopenblas-dev`** (−107 MiB). Only needed to *compile* against BLAS; NumPy/SciPy wheels bundle their own OpenBLAS.
+- **`libicu-dev`** (−50 MiB). Only needed to *compile* against ICU; `dotnet-runtime-10.0` depends on the runtime `libicu78`, which still comes in.
+- **tree-sitter grammars trimmed** from 11 languages to 6 (−~90 MiB). Controlled by the `TREE_SITTER_GRAMMARS` build arg; `tree-sitter-cli` clones any other grammar on demand.
 
-- `libopenblas-dev` → drop it. NumPy's wheels bundle their own OpenBLAS; the `-dev` package is only needed to *compile* against BLAS. Saves 107 MiB.
-- `libicu-dev` → drop it. .NET needs the runtime `libicu78`, which comes in anyway as a dependency. Saves 50 MiB.
-- Trim the tree-sitter grammar clones to the languages you actually use, or drop them — `tree-sitter-cli` can fetch a grammar on demand. Saves up to 200 MiB.
-- Drop whichever of the four agent CLIs you don't use. `opencode-ai` is 175 MiB and `happy` is 107 MiB; each is a one-line `npm i -g` when wanted.
-
-**Biggest win, and worth it — SQL Server as a sidecar (~1.45 GB):**
-
-`mssql-server` is 1.45 GB baked into an image you rebuild often. Running it as a second compose service from `mcr.microsoft.com/mssql/server:2025-latest` is Microsoft's supported arrangement: the image is pulled once and cached outside your rebuild loop, upgrades independently, and a corrupted instance is `docker compose rm` rather than a rebuild. Keep `mssql-tools18` (5 MiB) in the dev container for `sqlcmd`. This also removes `scripts/start-mssql.sh` and the `mssql.conf` handling.
+### Still available
 
 **Build agents — drop unless you self-host (~1.05 GB):**
 
-The Azure DevOps agent and GitHub Actions runner are ~1 GB together, each bundling its own .NET and Node, and **both self-update on registration anyway** — so the baked-in version is discarded the first time you configure one. Replace with a download-on-demand step inside `start-azp-agent.sh` / `start-gh-runner.sh`. Biggest saving for the least loss in the whole image.
+The Azure DevOps agent and GitHub Actions runner are ~1 GB together, each bundling its own .NET and Node, and **both self-update on registration anyway** — so the baked-in version is discarded the first time you configure one. Replace with a download-on-demand step inside `start-azp-agent.sh` / `start-gh-runner.sh`. Biggest remaining saving for the least loss.
+
+**Agent CLIs (~280 MB):** drop whichever of the four you don't use — `opencode-ai` is 175 MiB, `happy` is 107 MiB. Each is a one-line `npm i -g` when wanted. Left in place because which ones matter is a per-user call.
 
 **Real tradeoffs — only if you don't use them:**
 
@@ -322,14 +347,15 @@ The Azure DevOps agent and GitHub Actions runner are ~1 GB together, each bundli
 | .NET 11 preview SDK | ~800 MiB | Targeting .NET 11; .NET 10 SDK stays |
 | `azure-functions-core-tools` | ~600 MiB | Local Functions host. Reinstallable via npm |
 | `rust-all` → `rustc cargo rustfmt clippy` | ~250 MiB | `rust-src` (worse rust-analyzer completion) and Rust docs |
+| `rust-all` entirely | ~646 MiB | Rust entirely; `rust-analyzer` would have nothing to analyse |
 | `golang-go` + `gopls` | ~254 MiB | Go entirely |
 | `ffmpeg` | ~215 MiB | Audio/video transcode; needed for whisper-style workflows |
 | Hermes | ~400 MiB | The Hermes agent, and the trickiest step in the build |
 | `azure-cli` apt → `uv tool install azure-cli` | ~300 MiB | Shares the system Python instead of bundling one. Less battle-tested |
 
-Doing the two structural changes (SQL Server sidecar, on-demand agents) plus the free wins takes the image from ~11 GB to **roughly 8 GB with no loss of function**. Adding the .NET 11 and Functions-tools cuts gets it near 6.5 GB.
+The cuts applied so far take the image from ~11 GB to **roughly 9 GB with no loss of function**. Making the agents download-on-demand would land near 8 GB; adding the .NET 11 and Functions-tools cuts gets it to about 6.5 GB.
 
-**What not to cut:** the pre-warm caches and PostgreSQL. The caches are the reason the container is fast on first use, and Postgres is 26 MiB — cheaper than the paragraph describing it.
+**What not to cut:** the pre-warm caches and PostgreSQL. The caches are the reason the container is fast on first use, and Postgres is 32 MiB — cheaper than the paragraph describing it.
 
 ### Auditing the real image
 

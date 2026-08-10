@@ -49,6 +49,7 @@ ARG NODE_MAJOR=26
 # falls back to unpinned `nodejs`.
 ARG NODE_VERSION=26.6.0
 ARG ENABLE_AMD64V3=1
+ARG TREE_SITTER_GRAMMARS="c-sharp python typescript javascript bash sql"
 
 FROM ubuntu:${UBUNTU_TAG}
 
@@ -59,6 +60,7 @@ ARG AZP_AGENT_VERSION
 ARG RTK_VERSION
 ARG ENABLE_AMD64V3
 ARG UBUNTU_TAG
+ARG TREE_SITTER_GRAMMARS
 
 #-----------------------------------------------------------------------------
 # 1. Environment
@@ -165,7 +167,9 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 #-----------------------------------------------------------------------------
 # 3. Third-party apt repos (signed-by keyrings)
 #-----------------------------------------------------------------------------
-# Microsoft: mssql-server, mssql-tools18/msodbcsql18, Azure CLI.
+# Microsoft: mssql-tools18/msodbcsql18 (client only), Azure CLI.
+# The SQL Server *engine* is NOT in this image — it runs as the `mssql` compose
+# service from mcr.microsoft.com/mssql/server. See scripts/start-mssql.sh.
 # Deliberately still pinned to the noble (24.04) suites — Microsoft publishes no
 # 26.10 suite, and its 26.04 "prod" feed carries only moby/kubernetes packages,
 # not the SQL tooling. The noble debs install cleanly on 26.10 (their deps —
@@ -182,8 +186,6 @@ RUN curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
  && chmod 0644 /etc/apt/keyrings/microsoft.gpg \
  && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/ubuntu/24.04/prod noble main" \
       > /etc/apt/sources.list.d/microsoft-prod.list \
- && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/ubuntu/24.04/mssql-server-2025 noble main" \
-      > /etc/apt/sources.list.d/mssql-server-2025.list \
  && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/azure-cli/ noble main" \
       > /etc/apt/sources.list.d/azure-cli.list
 
@@ -247,11 +249,20 @@ RUN install -d -m 0755 /etc/postgresql-common \
 #      libmagic1 -> libmagic1t64 (64-bit time_t transition)
 #      repo (Android multi-repo tool) was dropped from the archive — installed
 #      from Google's official launcher in step 11 instead.
+#
+#    Deliberately NOT installed (do not re-add without a reason):
+#      mssql-server     1.45 GB. The engine runs as the `mssql` compose service
+#                       from mcr.microsoft.com/mssql/server instead. The client
+#                       side (mssql-tools18 -> msodbcsql18 -> unixodbc) stays.
+#      libicu-dev       50 MB, only needed to COMPILE against ICU. .NET needs the
+#                       runtime libicu78, which dotnet-runtime-10.0 depends on.
+#      libopenblas-dev  107 MB, only needed to COMPILE against BLAS. NumPy/SciPy
+#                       wheels bundle their own OpenBLAS.
 #-----------------------------------------------------------------------------
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     set -eux; \
-    export ACCEPT_EULA=Y MSSQL_PID=Developer DEBIAN_FRONTEND=noninteractive; \
+    export ACCEPT_EULA=Y DEBIAN_FRONTEND=noninteractive; \
     apt-get update; \
     NODEJS_PKG="$(apt-cache madison nodejs | awk -v v="${NODE_VERSION}" '$3 ~ v {print "nodejs="$3; exit}')"; \
     : "${NODEJS_PKG:=nodejs}"; \
@@ -270,7 +281,6 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         iputils-ping \
         jq \
         less \
-        libicu-dev \
         libmagic1t64 \
         libssl-dev \
         man-db \
@@ -314,7 +324,6 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         gh \
         golang-go \
         gopls \
-        mssql-server \
         mssql-tools18 \
         poppler-utils \
         postgresql-18 \
@@ -322,7 +331,6 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         libpq-dev \
         rust-all \
         sqlite3 \
-        libopenblas-dev \
         libnss3 \
         libnss3-tools \
         libatk1.0-0t64 \
@@ -628,8 +636,11 @@ RUN mkdir -p /opt/gh-runner \
 #-----------------------------------------------------------------------------
 # 13. Tree-sitter grammars + ast-grep rule packs
 #-----------------------------------------------------------------------------
+# Grammar sources only (not compiled), ~20 MB each. Trimmed from 11 languages to
+# the ones this image's stack actually uses; `tree-sitter-cli` can clone any other
+# grammar on demand. Override with --build-arg TREE_SITTER_GRAMMARS="a b c".
 RUN mkdir -p /opt/tree-sitter-grammars \
- && for g in c-sharp python typescript javascript bash rust go sql yaml html css; do \
+ && for g in ${TREE_SITTER_GRAMMARS}; do \
         git clone --depth=1 "https://github.com/tree-sitter/tree-sitter-${g}.git" \
             "/opt/tree-sitter-grammars/tree-sitter-${g}" \
             2>/dev/null || echo "skip ${g}"; \
@@ -790,13 +801,13 @@ RUN set -eu; \
         fi; \
     fi
 
-RUN id mssql >/dev/null    || { echo "mssql user not created — mssql-server postinst failed" >&2; exit 1; } \
- && id postgres >/dev/null || { echo "postgres user not created — postgresql-18 postinst failed" >&2; exit 1; } \
+RUN id postgres >/dev/null || { echo "postgres user not created — postgresql-18 postinst failed" >&2; exit 1; } \
  && test -x /usr/lib/postgresql/18/bin/postgres \
  && test -x /usr/local/bin/repo \
  && test -f /etc/security/limits.d/90-aidev.conf \
- && test -x /opt/mssql/bin/sqlservr \
  && test -x /opt/mssql-tools18/bin/sqlcmd \
+ && test -x /opt/mssql-tools18/bin/bcp \
+ && odbcinst -q -d | grep -qi 'ODBC Driver 18 for SQL Server' \
  && test -x /usr/local/bin/dotnet \
  && test -x /usr/local/bin/uv \
  && test -x /usr/local/bin/rtk \

@@ -41,7 +41,7 @@ services:
     # outgrow — Chromium crashes, SQL Server logs shared-memory errors.
     shm_size: "2gb"
     environment:
-      TZ: Europe/Brussels
+      TZ: Europe/Amsterdam
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
     # Uncomment to pass GPUs through (requires nvidia-container-toolkit on the host).
@@ -55,7 +55,6 @@ services:
     volumes:
       - ../:/workspaces/aidevcontainer:cached
       - /var/run/docker.sock:/var/run/docker.sock
-      - mssql-data:/var/opt/mssql
       - pg-data:/var/lib/postgresql/18/main
       - uv-cache:/home/vscode/.cache/uv
       - nuget-cache:/home/vscode/.nuget
@@ -71,6 +70,49 @@ services:
         tmpfs:
           size: 4294967296
     command: ["sleep", "infinity"]
+
+  # SQL Server 2025 as its own container rather than baked into the dev image.
+  # The engine is 1.45 GB — keeping it out of an image you rebuild often is the
+  # single biggest size win, and it upgrades independently of your toolchain.
+  #
+  # Behind the `mssql` profile so it does NOT start with the dev container (the
+  # engine wants ~2 GB of RAM). Start it with `bash scripts/start-mssql.sh` from
+  # inside the dev container, or from the host:
+  #   docker compose -f .devcontainer/docker-compose.yml --profile mssql up -d mssql
+  #
+  # From the dev container, connect to host `mssql` (the service name), NOT
+  # localhost — the engine is a separate container on the compose network:
+  #   sqlcmd -S mssql,1433 -U sa -P "$(cat ~/.mssql-password)" -No
+  mssql:
+    profiles: ["mssql"]
+    image: mcr.microsoft.com/mssql/server:2025-latest
+    hostname: mssql
+    restart: unless-stopped
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: Developer
+      # Supplied by scripts/start-mssql.sh, which generates it into
+      # ~/.mssql-password on first run and exports it. Left with an empty default
+      # rather than compose's required-variable form (`:?`), because compose
+      # interpolates the WHOLE file regardless of active profiles — a required
+      # variable here would break `up` for the dev service too. If it is empty the
+      # SQL Server image itself refuses to start with a clear message.
+      # Baked in at container creation: changing it later needs
+      # `docker compose rm -f mssql` (the data volume survives).
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:-}
+      MSSQL_TCP_PORT: "1433"
+      MSSQL_LCID: "1033"
+      MSSQL_MEMORY_LIMIT_MB: "4096"
+      TZ: Europe/Amsterdam
+    ports:
+      - "1433:1433"
+    volumes:
+      - mssql-data:/var/opt/mssql
+    # SQL Server on Linux wants a high fd ceiling and locked pages.
+    ulimits:
+      nofile:  { soft: 1048576, hard: 1048576 }
+      memlock: { soft: -1, hard: -1 }
+    shm_size: "1gb"
 
 volumes:
   mssql-data:

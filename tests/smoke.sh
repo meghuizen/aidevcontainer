@@ -103,7 +103,11 @@ echo "--- DBs (clients) ---"
 check "duckdb"                  duckdb --version
 check "psql 18"                 bash -c 'psql --version | grep -q "psql .* 18"'
 check "sqlcmd"                  bash -c '/opt/mssql-tools18/bin/sqlcmd -? 2>&1 | head -n1 | grep -i sqlcmd'
+check "bcp"                     test -x /opt/mssql-tools18/bin/bcp
+check "odbc driver 18"          bash -c "odbcinst -q -d | grep -qi 'ODBC Driver 18 for SQL Server'"
 check "sqlite3"                 sqlite3 --version
+# The SQL Server ENGINE is not in this image — it runs as the `mssql` compose
+# service. Only the client stack is verified here.
 
 echo "--- AI / media ---"
 check "huggingface-cli"         huggingface-cli --help
@@ -143,8 +147,9 @@ check "py docx/openpyxl/pdf*"   /opt/venv/bin/python -c "import docx, pptx, open
 
 if [[ "${AIDEV_SMOKE_FULL:-0}" == "1" ]]; then
   echo "--- Services (full mode) ---"
+  # Starts the `mssql` compose service; connect by service name, not localhost.
   bash scripts/start-mssql.sh
-  check "sqlcmd connect"        bash -c '/opt/mssql-tools18/bin/sqlcmd -S localhost,1433 -U sa -P "$(cat ~/.mssql-password)" -No -Q "SELECT @@VERSION"'
+  check "sqlcmd connect"        bash -c '/opt/mssql-tools18/bin/sqlcmd -S "${MSSQL_HOST:-mssql},1433" -U sa -P "$(cat ~/.mssql-password)" -No -Q "SELECT @@VERSION"'
 
   bash scripts/start-postgres.sh
   check "psql connect"          bash -c 'psql -U postgres -h 127.0.0.1 -c "SELECT version();"'

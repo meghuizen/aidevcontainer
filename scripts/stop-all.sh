@@ -4,7 +4,12 @@
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-pkill -f sqlservr            2>/dev/null || true
+# SQL Server runs as the `mssql` compose service, not a process in this container.
+# `stop` (not `down`) so the data volume and the container's baked-in SA password survive.
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    docker compose -f "$SCRIPT_DIR/../.devcontainer/docker-compose.yml" \
+        --profile mssql stop mssql 2>/dev/null || true
+fi
 # start-postgres.sh starts via bare pg_ctl against /var/lib/postgresql/18/main, not the
 # Debian cluster registry, so pg_ctlcluster won't find it. Use pg_ctl with the matching dir.
 sudo -u postgres /usr/lib/postgresql/18/bin/pg_ctl \

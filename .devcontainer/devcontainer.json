@@ -6,7 +6,7 @@
   "workspaceFolder": "/workspaces/aidevcontainer",
   "remoteUser": "vscode",
   "containerEnv": {
-    "TZ": "Europe/Brussels"
+    "TZ": "Europe/Amsterdam"
   },
   "forwardPorts": [1433, 5432, 10000, 10001, 10002, 7071],
   "portsAttributes": {
