@@ -5,17 +5,41 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
+      # Only knobs worth overriding from here. Everything else (UBUNTU_TAG,
+      # NODE_MAJOR, NODE_VERSION) stays at its Dockerfile ARG default so there is
+      # one place to bump it.
       args:
-        GH_RUNNER_VERSION: "2.334.0"
-        AZP_AGENT_VERSION: "4.272.0"
+        GH_RUNNER_VERSION: "2.336.0"
+        AZP_AGENT_VERSION: "5.277.0"
         RTK_VERSION: ""
+        # x86-64-v3 optimized Ubuntu packages (AVX2/FMA/BMI2).
+        # Set to "0" if this image must run on a pre-2013 CPU.
+        ENABLE_AMD64V3: "1"
     image: aidev:latest
     init: true
     hostname: aidev
     cap_add: [SYS_PTRACE]
     security_opt: [seccomp=unconfined]
+    # The hard ceilings here are what the container actually gets — pam_limits
+    # inside the image can only lower them, never raise them.
     ulimits:
-      nofile: { soft: 1048576, hard: 1048576 }
+      nofile:  { soft: 1048576, hard: 1048576 }
+      nproc:   { soft: 262144,  hard: 262144 }
+      memlock: { soft: -1, hard: -1 }
+      # stack: leave the SOFT limit at the glibc default 8 MB — glibc uses it as the
+      # default pthread stack size, so raising it makes every thread reserve 64 MB of
+      # address space. Only the hard ceiling is raised, so `ulimit -s` can be bumped
+      # per-process when something actually needs deep recursion.
+      stack:   { soft: 8388608, hard: 67108864 }
+      core:    { soft: 0, hard: 0 }
+    # Only namespaced sysctls can be set from compose; vm.* / fs.* are host-wide
+    # and would make the container fail to start.
+    sysctls:
+      net.core.somaxconn: "8192"
+      net.ipv4.ip_local_port_range: "10240 65535"
+    # /dev/shm default is 64 MB, which Chromium (Playwright) and SQL Server both
+    # outgrow — Chromium crashes, SQL Server logs shared-memory errors.
+    shm_size: "2gb"
     environment:
       TZ: Europe/Brussels
       NVIDIA_VISIBLE_DEVICES: all

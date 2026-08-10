@@ -22,8 +22,20 @@ check() {
 }
 
 echo "--- system ---"
-check "ubuntu 26.04"          bash -c 'lsb_release -a 2>/dev/null | grep -q "26.04"'
+check "ubuntu 26.10"           bash -c 'lsb_release -a 2>/dev/null | grep -q "26.10"'
 check "en_US locale"           bash -c 'locale | grep -q en_US.UTF-8'
+# amd64v3 is optional (ENABLE_AMD64V3=0 is a supported build), so only assert the
+# CPU baseline when the image was actually built against the v3 package set.
+if apt-config dump 2>/dev/null | grep -qi "architecture-variants.*amd64v3"; then
+  # `ld.so` is not on PATH on Ubuntu — ask the dynamic loader directly.
+  check "cpu supports x86-64-v3" bash -c \
+    'L="$(command -v ld.so || echo /lib64/ld-linux-x86-64.so.2)"; "$L" --help 2>/dev/null | grep -q "x86-64-v3.*supported"'
+else
+  echo "  skip amd64v3 (built with ENABLE_AMD64V3=0)"
+fi
+check "nofile ulimit >= 1M"    bash -c '[[ "$(ulimit -Hn)" -ge 1048576 ]]'
+check "core dumps disabled"    bash -c '[[ "$(ulimit -Hc)" == "0" ]]'
+check "limits.d installed"     test -f /etc/security/limits.d/90-aidev.conf
 
 echo "--- .NET ---"
 check "dotnet sdk 10"           bash -c 'dotnet --list-sdks | grep -q "^10\."'
@@ -45,7 +57,7 @@ check "func core tools"         func --version
 check "azurite"                 azurite --version
 
 echo "--- Node ---"
-check "node 25.9.x"             bash -c 'node --version | grep -qE "^v25\.9\."'
+check "node 26.6.x"             bash -c 'node --version | grep -qE "^v26\.6\."'
 check "npm"                     npm --version
 check "pnpm (default pm)"       pnpm --version
 check "yarn"                    yarn --version
@@ -84,7 +96,7 @@ check "zip"                     zip -v
 check "rsync"                   rsync --version
 # yarn (classic CLI) is provided by corepack — `yarn --version` already verified
 # under "--- Node ---". The apt `yarnpkg` package is intentionally NOT installed because
-# it pulls in Debian's nodejs and ~150 node-* packages that NodeSource Node 25 then
+# it pulls in Debian's nodejs and ~150 node-* packages that NodeSource Node 26 then
 # removes, defeating the install.
 
 echo "--- DBs (clients) ---"

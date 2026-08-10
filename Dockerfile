@@ -1,15 +1,28 @@
 # syntax=docker/dockerfile:1.7
 ###############################################################################
-# ai-dev container — Ubuntu 26.04 LTS (Resolute Raccoon)
+# ai-dev container — Ubuntu 26.10 (stonking)
+#
+# NOTE: 26.10 is a non-LTS interim release. At the time of writing it is still
+# in development (GA October 2026), so `ubuntu:26.10` is a moving snapshot and
+# third-party apt repos mostly do not publish a `stonking` suite yet. Only the
+# Docker repo probes for a matching suite; Microsoft is pinned to `noble`,
+# GitHub CLI uses `stable`, and NodeSource uses its distro-less `nodistro`.
+#
+# amd64v3: Ubuntu 26.10 publishes a second set of binaries built for the
+# x86-64-v3 microarchitecture level (AVX2/FMA/BMI2 — Intel Haswell / AMD
+# Excavator and newer). Enabling it is one apt config line; apt silently falls
+# back to plain amd64 for any package that has no v3 build. Controlled by the
+# ENABLE_AMD64V3 build arg (default 1). Set it to 0 if the image must run on a
+# pre-2013 CPU — v3 binaries crash with SIGILL there.
 #
 # Single-stage build: ONE consolidated `apt-get install` for every native package
 # the image needs (build deps + runtime tools + language runtimes + DBs +
 # Playwright libs). Subsequent RUN steps build on top using those tools.
 #
 # Order:
-#   1. ENV (telemetry off, locale, etc.)
-#   2. Bootstrap apt (curl, ca-certs, gnupg, lsb-release, software-properties-common)
-#   3. Third-party apt repos (Microsoft, GitHub CLI, Docker, NodeSource, PGDG)
+#   1. ENV (telemetry off, locale, performance defaults)
+#   2. Bootstrap apt (amd64v3 opt-in, apt/dpkg tuning, full-upgrade, repo keys)
+#   3. Third-party apt repos (Microsoft, GitHub CLI, Docker, NodeSource)
 #   4. ONE BIG apt install (build/runtime utilities + .NET 10 + Node + Python + DBs + Playwright libs)
 #   5. vscode user (UID 1000) + system PATH profile
 #   6. .NET global tools (Roslynator, Aspire CLI, csharp-ls, …) — against stable .NET 10 SDK
@@ -20,18 +33,22 @@
 #  11. Standalone binaries (yt-dlp, rust-analyzer, DuckDB, delta, lazygit, RTK, Hermes)
 #  12. Build agents (Azure DevOps, GitHub Actions runner)
 #  13. tree-sitter grammars + ast-grep rule packs
-#  14. fix-docker-perms + entrypoint scripts
+#  14. fix-docker-perms + entrypoint + resource limits (ulimit/sysctl)
 #  15. Project scripts/configs + prewarm
 #  16. Validation
 #  17. USER vscode + ENTRYPOINT
 ###############################################################################
 
-ARG UBUNTU_TAG=26.04
-ARG GH_RUNNER_VERSION=2.334.0
-ARG AZP_AGENT_VERSION=4.272.0
+ARG UBUNTU_TAG=26.10
+ARG GH_RUNNER_VERSION=2.336.0
+ARG AZP_AGENT_VERSION=5.277.0
 ARG RTK_VERSION=
-ARG NODE_MAJOR=25
-ARG NODE_VERSION=25.9.0
+ARG NODE_MAJOR=26
+# NodeSource lags nodejs.org by a release or two — pin to the newest version its
+# node_26.x repo actually publishes, or the madison lookup in step 4 silently
+# falls back to unpinned `nodejs`.
+ARG NODE_VERSION=26.6.0
+ARG ENABLE_AMD64V3=1
 
 FROM ubuntu:${UBUNTU_TAG}
 
@@ -40,9 +57,31 @@ ARG NODE_VERSION
 ARG GH_RUNNER_VERSION
 ARG AZP_AGENT_VERSION
 ARG RTK_VERSION
+ARG ENABLE_AMD64V3
+ARG UBUNTU_TAG
 
 #-----------------------------------------------------------------------------
 # 1. Environment
+#
+# Performance-related entries (the rest is telemetry/locale/tool paths):
+#   MALLOC_ARENA_MAX=8         glibc malloc arenas. Was 2 (memory-saving, but it
+#                              serialises allocation across threads). 8 matches a
+#                              typical dev box core count and trades some RSS for
+#                              throughput in multi-threaded builds/analysers.
+#   DOTNET_EnableWriteXorExecute=0
+#                              Disables W^X in the .NET JIT. Measurably faster
+#                              process startup, which dominates `dotnet` CLI use.
+#   DOTNET_TieredPGO=1         Profile-guided re-JIT of hot methods.
+#   DOTNET_CLI_USE_MSBUILD_SERVER=1
+#                              Keeps MSBuild worker processes warm between builds.
+#   NODE_OPTIONS=--max-old-space-size=8192
+#                              Raises the V8 heap ceiling (a ceiling, not an
+#                              allocation) so big TS projects and agent CLIs don't
+#                              OOM at the ~4 GB default.
+#   UV_THREADPOOL_SIZE=16      libuv's thread pool (Node fs/dns/zlib work).
+#                              Unrelated to the astral `uv` UV_* vars above.
+#   UV_COMPILE_BYTECODE=1      astral uv: pre-compiles .pyc at install time so
+#                              first import of an installed package is not slow.
 #-----------------------------------------------------------------------------
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=en_US.UTF-8 \
@@ -69,30 +108,75 @@ ENV DEBIAN_FRONTEND=noninteractive \
     UV_HTTP_TIMEOUT=300 \
     UV_LINK_MODE=copy \
     AZURE_EXTENSION_DIR=/opt/az-extensions \
-    DOTNET_ROOT=/usr/share/dotnet \
-    MALLOC_ARENA_MAX=2 \
+    DOTNET_ROOT=/usr/lib/dotnet \
+    UV_COMPILE_BYTECODE=1 \
+    MALLOC_ARENA_MAX=8 \
+    DOTNET_EnableWriteXorExecute=0 \
+    DOTNET_TieredPGO=1 \
+    DOTNET_CLI_USE_MSBUILD_SERVER=1 \
+    NODE_OPTIONS=--max-old-space-size=8192 \
+    UV_THREADPOOL_SIZE=16 \
     PATH=/usr/local/dotnet-tools:/opt/uv-tools/bin:/opt/venv/bin:/home/vscode/.local/bin:/home/vscode/.local/share/pnpm:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/azp-agent:/opt/gh-runner
 
 #-----------------------------------------------------------------------------
-# 2. Bootstrap apt (only what's needed to fetch repo keys)
+# 2. Bootstrap apt: build-speed tuning, amd64v3 opt-in, full upgrade, repo keys.
+#
+# `force-unsafe-io` skips dpkg's fsync after every unpacked file. Safe here —
+# a container filesystem that dies mid-build is thrown away and rebuilt — and it
+# is one of the biggest single wins on install time.
+#
+# `APT::Architecture-Variants "amd64v3"` is the official switch for Ubuntu's
+# x86-64-v3 rebuilds. apt prefers the v3 binary when the suite publishes one and
+# transparently uses the plain amd64 build otherwise, so this cannot break the
+# package set — only the required CPU baseline.
 #-----------------------------------------------------------------------------
+COPY <<'EOF' /etc/dpkg/dpkg.cfg.d/01-aidev-unsafe-io
+force-unsafe-io
+EOF
+
+COPY <<'EOF' /etc/apt/apt.conf.d/99-aidev
+Acquire::Retries "5";
+Acquire::Languages "none";
+Dpkg::Use-Pty "0";
+EOF
+
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
-    apt-get update && apt-get install -y --no-install-recommends \
+    set -eux; \
+    if [ "${ENABLE_AMD64V3}" = "1" ]; then \
+        echo 'APT::Architecture-Variants "amd64v3";' > /etc/apt/apt.conf.d/99-amd64v3; \
+        echo "amd64v3: enabled"; \
+    else \
+        echo "amd64v3: disabled (ENABLE_AMD64V3=${ENABLE_AMD64V3})"; \
+    fi; \
+    apt-get update; \
+    apt-get full-upgrade -y; \
+    apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         gnupg \
         locales \
         lsb-release \
-        software-properties-common \
-    && locale-gen en_US.UTF-8 \
-    && update-locale LANG=en_US.UTF-8 \
-    && install -d -m 0755 /etc/apt/keyrings
+        software-properties-common; \
+    locale-gen en_US.UTF-8; \
+    update-locale LANG=en_US.UTF-8; \
+    install -d -m 0755 /etc/apt/keyrings
 
 #-----------------------------------------------------------------------------
 # 3. Third-party apt repos (signed-by keyrings)
 #-----------------------------------------------------------------------------
-# Microsoft (.NET, mssql-tools18, mssql-server) + Azure CLI dedicated feed
+# Microsoft: mssql-server, mssql-tools18/msodbcsql18, Azure CLI.
+# Deliberately still pinned to the noble (24.04) suites — Microsoft publishes no
+# 26.10 suite, and its 26.04 "prod" feed carries only moby/kubernetes packages,
+# not the SQL tooling. The noble debs install cleanly on 26.10 (their deps —
+# libssl3t64, libicu78, unixodbc — all exist there).
+#
+# .NET is NOT taken from Microsoft any more: Ubuntu's own archive ships
+# dotnet-sdk-10.0 (10.0.109-0ubuntu1) with an amd64v3 build, which the Microsoft
+# feed does not. As of now the noble feed carries no .NET packages at all, but the
+# pin below makes that independent of Microsoft's future publishing choices —
+# otherwise a Microsoft `10.0.x-1` revision would out-rank Ubuntu's `-0ubuntu1`
+# and install to /usr/share/dotnet, breaking DOTNET_ROOT.
 RUN curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
       | gpg --dearmor -o /etc/apt/keyrings/microsoft.gpg \
  && chmod 0644 /etc/apt/keyrings/microsoft.gpg \
@@ -102,6 +186,15 @@ RUN curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
       > /etc/apt/sources.list.d/mssql-server-2025.list \
  && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/azure-cli/ noble main" \
       > /etc/apt/sources.list.d/azure-cli.list
+
+# Keep .NET on the Ubuntu archive no matter what Microsoft publishes. Scoped to
+# dotnet/aspnetcore only — mssql-tools18, msodbcsql18 and azure-cli still come
+# from Microsoft and are unaffected.
+COPY <<'EOF' /etc/apt/preferences.d/no-microsoft-dotnet
+Package: dotnet* aspnetcore*
+Pin: origin packages.microsoft.com
+Pin-Priority: -1
+EOF
 
 # GitHub CLI
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -115,7 +208,7 @@ RUN curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
       | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
  && chmod 0644 /etc/apt/keyrings/docker.gpg \
  && CODENAME="$(lsb_release -cs 2>/dev/null || echo noble)" \
- && for c in "$CODENAME" noble; do \
+ && for c in "$CODENAME" questing noble; do \
         if curl -fsI "https://download.docker.com/linux/ubuntu/dists/${c}/Release" >/dev/null 2>&1; then \
             echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${c} stable" \
                 > /etc/apt/sources.list.d/docker.list; \
@@ -130,26 +223,30 @@ RUN curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
  && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main" \
       > /etc/apt/sources.list.d/nodesource.list
 
-# PostgreSQL (PGDG) — fail loudly if no codename works so the build doesn't silently fall back to
-# stock Ubuntu's postgres (wrong major).
-RUN curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
-      | gpg --dearmor -o /etc/apt/keyrings/pgdg.gpg \
- && chmod 0644 /etc/apt/keyrings/pgdg.gpg \
- && set -e; \
-    for c in resolute-pgdg plucky-pgdg noble-pgdg; do \
-        if curl -fsI "https://apt.postgresql.org/pub/repos/apt/dists/${c}/Release" >/dev/null 2>&1; then \
-            echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt ${c} main" \
-                > /etc/apt/sources.list.d/pgdg.list; \
-            echo "PGDG: using ${c}"; \
-            FOUND=1; break; \
-        fi; \
-    done; \
-    [ -n "${FOUND:-}" ] || { echo "PGDG: no codename available (tried resolute-pgdg plucky-pgdg noble-pgdg)" >&2; exit 1; }
+# PostgreSQL: no PGDG repo. Ubuntu 26.10 main ships postgresql-18 itself (with an
+# amd64v3 build), so PGDG would only add a second origin for the same major — two
+# sources racing over one `postgresql-18` package, which is exactly what we don't
+# want. Single origin: the Ubuntu archive.
+#
+# Stop postgresql-common's postinst from auto-creating the 18/main cluster at BUILD
+# time. Its cluster keeps postgresql.conf under /etc/postgresql/18/main, but
+# scripts/start-postgres.sh installs this repo's config INTO the data dir and
+# starts postgres with `-c config_file=$PG_DATA/postgresql.conf`. With an
+# auto-created cluster the script sees a populated PG_DATA, skips its init branch,
+# never installs the config, and postgres then dies on a missing config_file.
+# Letting the script run initdb itself is the arrangement it was written for.
+RUN install -d -m 0755 /etc/postgresql-common \
+ && echo 'create_main_cluster = false' > /etc/postgresql-common/createcluster.conf
 
 #-----------------------------------------------------------------------------
 # 4. THE big apt install — every native package the image needs.
 #    Bootstrap layer + repos already added; this is one apt-get install for
 #    base utilities, language runtimes, DBs, and Playwright deps.
+#
+#    26.10 rename/removal notes vs 26.04:
+#      libmagic1 -> libmagic1t64 (64-bit time_t transition)
+#      repo (Android multi-repo tool) was dropped from the archive — installed
+#      from Google's official launcher in step 11 instead.
 #-----------------------------------------------------------------------------
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
@@ -174,7 +271,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         jq \
         less \
         libicu-dev \
-        libmagic1 \
+        libmagic1t64 \
         libssl-dev \
         man-db \
         nano \
@@ -182,7 +279,6 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         openssl \
         pkg-config \
         procps \
-        repo \
         ripgrep \
         rsync \
         sudo \
@@ -252,10 +348,14 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         zoxide; \
     ln -sf /usr/bin/fdfind /usr/local/bin/fd; \
     ln -sf /usr/bin/batcat /usr/local/bin/bat 2>/dev/null || true; \
-    ln -sf /usr/share/dotnet/dotnet /usr/local/bin/dotnet
+    test -x /usr/lib/dotnet/dotnet \
+      || { echo "dotnet did not land in /usr/lib/dotnet — wrong origin? check apt-cache policy dotnet-sdk-10.0" >&2; \
+           apt-cache policy dotnet-sdk-10.0 >&2; exit 1; }; \
+    ln -sf /usr/lib/dotnet/dotnet /usr/local/bin/dotnet; \
+    /usr/local/bin/dotnet --list-sdks
 
 #-----------------------------------------------------------------------------
-# 5. vscode user (UID 1000). Ubuntu 26.04 base ships with `ubuntu` at UID 1000;
+# 5. vscode user (UID 1000). The Ubuntu base image ships `ubuntu` at UID 1000;
 #    rename it rather than fail trying to add a fresh one.
 #-----------------------------------------------------------------------------
 RUN if id -u vscode >/dev/null 2>&1; then \
@@ -274,11 +374,13 @@ RUN if id -u vscode >/dev/null 2>&1; then \
  && echo 'vscode ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/vscode \
  && chmod 0440 /etc/sudoers.d/vscode
 
-# Centralized PATH for interactive shells (mirrors the ENV PATH above)
+# PATH safety net for shells that start from a cleared environment (some CI
+# agents, `su -`, `env -i bash -l`). Everything else — DOTNET_ROOT,
+# MALLOC_ARENA_MAX, the perf vars — is set once by ENV above and inherited by
+# login shells and `docker exec` alike. Do not restate ENV values here: this file
+# and the ENV block silently drifting apart is a real failure mode.
 COPY <<'EOF' /etc/profile.d/00-aidev-path.sh
 export PATH="/usr/local/dotnet-tools:/opt/uv-tools/bin:/opt/venv/bin:/home/vscode/.local/bin:${PNPM_HOME:-/home/vscode/.local/share/pnpm}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/azp-agent:/opt/gh-runner"
-export DOTNET_ROOT=/usr/share/dotnet
-export MALLOC_ARENA_MAX=2
 EOF
 
 #-----------------------------------------------------------------------------
@@ -293,19 +395,23 @@ RUN --mount=type=cache,target=/root/.nuget,sharing=locked \
  && dotnet tool install --tool-path /usr/local/dotnet-tools dotnet-script \
  && dotnet tool install --tool-path /usr/local/dotnet-tools csharp-ls \
  && dotnet tool install --tool-path /usr/local/dotnet-tools Aspire.Cli \
- && dotnet workload update --skip-sign-check \
- && dotnet workload list
+ && { dotnet workload update --skip-sign-check && dotnet workload list; } \
+      || echo "dotnet workloads: unavailable on this SDK build (non-fatal)"
 
 #-----------------------------------------------------------------------------
-# 7. .NET 11 side-by-side via dotnet-install.sh (apt only ships .NET 10)
+# 7. .NET 11 side-by-side via dotnet-install.sh. Ubuntu 26.10's archive has
+#    dotnet-sdk-10.0 but no dotnet-sdk-11.0, and .NET 11 is still preview.
 #-----------------------------------------------------------------------------
+#    Installed INTO /usr/lib/dotnet — the same root apt uses — because a single
+#    DOTNET_ROOT is what makes `dotnet --list-sdks` show both majors.
 RUN curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh \
  && chmod +x /tmp/dotnet-install.sh \
- && /tmp/dotnet-install.sh --channel 11.0 --quality preview --install-dir /usr/share/dotnet --no-path \
- && /tmp/dotnet-install.sh --channel 11.0 --quality preview --install-dir /usr/share/dotnet --runtime aspnetcore --no-path \
+ && /tmp/dotnet-install.sh --channel 11.0 --quality preview --install-dir /usr/lib/dotnet --no-path \
+ && /tmp/dotnet-install.sh --channel 11.0 --quality preview --install-dir /usr/lib/dotnet --runtime aspnetcore --no-path \
  && rm /tmp/dotnet-install.sh \
- && ls /usr/share/dotnet/sdk \
- && ls /usr/share/dotnet/shared/Microsoft.AspNetCore.App
+ && ls /usr/lib/dotnet/sdk \
+ && ls /usr/lib/dotnet/shared/Microsoft.AspNetCore.App \
+ && dotnet --list-sdks
 
 #-----------------------------------------------------------------------------
 # 8. npm config + corepack + global npm packages
@@ -420,7 +526,13 @@ RUN curl -fsSL "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp
  && chmod +x /usr/local/bin/yt-dlp \
  && yt-dlp --version
 
-# rust-analyzer (not in Ubuntu 26.04 apt repos)
+# repo (Android multi-repository tool). Ubuntu 26.10 dropped the `repo` package;
+# this is the official launcher script, which needs only python3.
+RUN curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo \
+ && chmod 0755 /usr/local/bin/repo \
+ && head -n1 /usr/local/bin/repo | grep -q python
+
+# rust-analyzer (not in Ubuntu apt repos)
 RUN curl -fsSL "https://github.com/rust-lang/rust-analyzer/releases/latest/download/rust-analyzer-x86_64-unknown-linux-gnu.gz" \
       -o /tmp/rust-analyzer.gz \
  && gunzip /tmp/rust-analyzer.gz \
@@ -458,10 +570,10 @@ RUN set -eux; \
 #  - Force HTTPS for git clones — installer tries SSH first, no credentials in build env.
 #  - Spoof /etc/os-release as Ubuntu 24.04 for the duration of the install. The installer
 #    runs `npx playwright install --with-deps chromium`; Playwright's binary-host map
-#    doesn't include ubuntu26.04-x64 yet and rejects with "does not support chromium on
-#    ubuntu26.04-x64". Pretending to be 24.04 (noble) lets the Chromium download proceed
+#    doesn't include ubuntu26.10-x64 yet and rejects with "does not support chromium on
+#    ubuntu26.10-x64". Pretending to be 24.04 (noble) lets the Chromium download proceed
 #    against the apt deps we already installed (libnss3, libcups2t64, libatk*t64, etc.).
-#    /etc/os-release is restored after the install so `lsb_release -a` etc. report 26.04.
+#    /etc/os-release is restored after the install so `lsb_release -a` etc. report 26.10.
 RUN set -eux; \
     install -d -m 0755 /opt/hermes-install; \
     git config --system url."https://github.com/".insteadOf "git@github.com:"; \
@@ -559,9 +671,77 @@ exec "$@"
 EOF
 RUN chmod +x /usr/local/bin/aidev-entrypoint
 
-# inotify limits (best-effort; ignored if container lacks the cap)
-RUN printf 'fs.inotify.max_user_watches=524288\nfs.inotify.max_user_instances=8192\n' \
-      > /etc/sysctl.d/90-inotify.conf
+#-----------------------------------------------------------------------------
+# Resource limits.
+#
+# Two separate mechanisms, both needed:
+#
+#  a) limits.d — pam_limits, which only runs for *login-ish* sessions (`su`,
+#     `sudo -i`, ssh). It is what raises limits for the DB servers we start via
+#     `sudo -u postgres` / `sudo -u mssql`.
+#  b) profile.d — raises each interactive shell's SOFT limit to its HARD limit.
+#     A `docker exec` does not go through PAM, so it inherits whatever the
+#     container was created with; the hard ceiling itself comes from the Docker
+#     daemon, i.e. the `ulimits:` block in .devcontainer/docker-compose.yml.
+#
+# nofile is the one that actually bites: pnpm/node watchers, Roslyn, and
+# ripgrep all burn file descriptors fast. memlock matters for SQL Server's
+# locked pages and for io_uring. core=0 stops multi-GB core dumps from .NET or
+# Chromium filling the container's writable layer.
+#-----------------------------------------------------------------------------
+# Values must match the compose `ulimits:` block — the container ceiling always
+# wins, so a larger number here would just be a lie. `*` does not cover root in
+# limits.conf, hence the explicit root rows.
+COPY <<'EOF' /etc/security/limits.d/90-aidev.conf
+# domain  type   item     value
+*         soft   nofile   1048576
+*         hard   nofile   1048576
+*         soft   nproc    262144
+*         hard   nproc    262144
+*         soft   memlock  unlimited
+*         hard   memlock  unlimited
+*         soft   stack    8192
+*         hard   stack    65536
+*         soft   core     0
+*         hard   core     0
+root      soft   nofile   1048576
+root      hard   nofile   1048576
+root      soft   nproc    262144
+root      hard   nproc    262144
+root      soft   memlock  unlimited
+root      hard   memlock  unlimited
+root      soft   stack    8192
+root      hard   stack    65536
+root      soft   core     0
+root      hard   core     0
+EOF
+
+# Raise soft limits to the hard ceiling the container was started with. Under the
+# compose file these are already correct; the lines matter for a plain
+# `docker run` with no --ulimit flags, where memlock defaults to 64 KB and core
+# dumps are unbounded. Best-effort: a restricted container keeps its defaults.
+COPY <<'EOF' /etc/profile.d/10-aidev-limits.sh
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
+ulimit -l unlimited       2>/dev/null || true
+ulimit -c 0               2>/dev/null || true
+EOF
+
+# Kernel tunables that are NOT namespaced, so they can only come from the host or
+# a privileged run. NOTE: nothing applies /etc/sysctl.d inside an unprivileged
+# container (no systemd-sysctl here) — this file is inert there, and is kept as
+# the documented target plus a privileged-run convenience.
+# The namespaced values (net.core.somaxconn, net.ipv4.ip_local_port_range) are
+# deliberately NOT here: compose `sysctls:` owns those, one home per number.
+COPY <<'EOF' /etc/sysctl.d/90-aidev.conf
+# File watching — VS Code, dotnet watch, vite, and pnpm all register watches.
+fs.inotify.max_user_watches=524288
+fs.inotify.max_user_instances=8192
+fs.file-max=2097152
+# Many small mmaps: .NET, JVM-style tooling, Chromium.
+vm.max_map_count=1048576
+# Prefer keeping page cache over swapping build artefacts out.
+vm.swappiness=10
+EOF
 
 #-----------------------------------------------------------------------------
 # 15. Project scripts/configs + prewarm
@@ -585,9 +765,36 @@ RUN mkdir -p /home/vscode/.cache /home/vscode/.local/share /home/vscode/.config 
 #-----------------------------------------------------------------------------
 # 16. Validation — fail loud if anything critical is missing
 #-----------------------------------------------------------------------------
+# Report the base release so a stale cached layer or a retagged base is visible in
+# the build log. Deliberately a warning, not a failure: on a pre-GA series the
+# base image's VERSION_ID is not something to bet a whole build on.
+# tests/smoke.sh asserts the release properly, at run time.
+RUN set -eu; \
+    . /etc/os-release; \
+    echo "release: ${VERSION_ID:-?} ${VERSION_CODENAME:-?} (requested ${UBUNTU_TAG})"; \
+    [ "${VERSION_ID:-}" = "${UBUNTU_TAG}" ] \
+      || echo "WARNING: base image is Ubuntu ${VERSION_ID:-unknown}, expected ${UBUNTU_TAG}" >&2
+
+# `ld.so` is not on PATH on Ubuntu — ask the dynamic loader directly. It lists the
+# glibc-hwcaps levels it will search, e.g. "x86-64-v3 (supported, searched)".
+RUN set -eu; \
+    if [ "${ENABLE_AMD64V3}" = "1" ]; then \
+        apt-config dump | grep -qi 'APT::Architecture-Variants.*amd64v3' \
+          || { echo "amd64v3 was requested but apt is not configured for it" >&2; exit 1; }; \
+        LOADER="$(command -v ld.so || echo /lib64/ld-linux-x86-64.so.2)"; \
+        if "$LOADER" --help 2>/dev/null | grep -q 'x86-64-v3.*supported'; then \
+            echo "amd64v3: build host CPU supports x86-64-v3"; \
+        else \
+            echo "amd64v3: NOTE — could not confirm x86-64-v3 on this build host." >&2; \
+            echo "amd64v3: the image is still valid; it just needs a v3-capable CPU to run." >&2; \
+        fi; \
+    fi
+
 RUN id mssql >/dev/null    || { echo "mssql user not created — mssql-server postinst failed" >&2; exit 1; } \
  && id postgres >/dev/null || { echo "postgres user not created — postgresql-18 postinst failed" >&2; exit 1; } \
  && test -x /usr/lib/postgresql/18/bin/postgres \
+ && test -x /usr/local/bin/repo \
+ && test -f /etc/security/limits.d/90-aidev.conf \
  && test -x /opt/mssql/bin/sqlservr \
  && test -x /opt/mssql-tools18/bin/sqlcmd \
  && test -x /usr/local/bin/dotnet \
@@ -620,6 +827,6 @@ ENTRYPOINT ["/usr/local/bin/aidev-entrypoint"]
 CMD ["sleep", "infinity"]
 
 LABEL org.opencontainers.image.title="ai-dev" \
-      org.opencontainers.image.description="High-performance dev container for AI software development on Ubuntu 26.04 (Resolute Raccoon)" \
+      org.opencontainers.image.description="High-performance dev container for AI software development on Ubuntu 26.10 (amd64v3-optimized)" \
       org.opencontainers.image.source="https://github.com/" \
       org.opencontainers.image.licenses="MIT"
