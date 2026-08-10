@@ -1,0 +1,60 @@
+name: aidev
+
+services:
+  dev:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        GH_RUNNER_VERSION: "2.334.0"
+        AZP_AGENT_VERSION: "4.272.0"
+        RTK_VERSION: ""
+    image: aidev:latest
+    init: true
+    hostname: aidev
+    cap_add: [SYS_PTRACE]
+    security_opt: [seccomp=unconfined]
+    ulimits:
+      nofile: { soft: 1048576, hard: 1048576 }
+    environment:
+      TZ: Europe/Brussels
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
+    # Uncomment to pass GPUs through (requires nvidia-container-toolkit on the host).
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    volumes:
+      - ../:/workspaces/aidevcontainer:cached
+      - /var/run/docker.sock:/var/run/docker.sock
+      - mssql-data:/var/opt/mssql
+      - pg-data:/var/lib/postgresql/18/main
+      - uv-cache:/home/vscode/.cache/uv
+      - nuget-cache:/home/vscode/.nuget
+      - npm-cache:/home/vscode/.npm
+      - pnpm-store:/home/vscode/.cache/pnpm
+      - hf-cache:/home/vscode/.cache/huggingface
+      - claude-config:/home/vscode/.claude
+      - azure-config:/home/vscode/.azure
+      # tmpfs long-form: short-form `- /tmp:size=4g,exec` is parsed as a literal path
+      # by compose; long-form is the only way to set size.
+      - type: tmpfs
+        target: /tmp
+        tmpfs:
+          size: 4294967296
+    command: ["sleep", "infinity"]
+
+volumes:
+  mssql-data:
+  pg-data:
+  uv-cache:
+  nuget-cache:
+  npm-cache:
+  pnpm-store:
+  hf-cache:
+  claude-config:
+  azure-config:
