@@ -125,7 +125,9 @@ Heavy services do not auto-start. Launch them when you need them:
 | `bash scripts/gpu-check.sh` | Report GPU presence | — |
 | `bash scripts/stop-all.sh` | Stop everything | — |
 
-**SQL Server runs in its own container.** The 1.45 GB engine is not baked into the dev image. `.devcontainer/docker-compose.yml` declares an `mssql` service using `mcr.microsoft.com/mssql/server:2025-latest`, behind the compose profile `mssql` so it does **not** start with the dev container (the engine wants ~2 GB of RAM).
+### SQL Server runs in its own container
+
+The 1.45 GB engine is not baked into the dev image. `.devcontainer/docker-compose.yml` declares an `mssql` service using `mcr.microsoft.com/mssql/server:2025-latest`, behind the compose profile `mssql` so it does **not** start with the dev container (the engine wants ~2 GB of RAM).
 
 `bash scripts/start-mssql.sh` works exactly as before — it generates the SA password at `~/.mssql-password` on first run, brings the service up, and waits until the engine answers. It drives compose through the mounted Docker socket, so it works from inside the dev container or from the host. From the host directly:
 
