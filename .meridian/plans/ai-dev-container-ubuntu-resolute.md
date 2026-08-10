@@ -1,5 +1,11 @@
 # AI Dev Container — Ubuntu 26.04 (Resolute Raccoon)
 
+> **SUPERSEDED (2026-08-10).** The image now targets Ubuntu 26.10 with amd64v3
+> packages. This document is kept as the original design record and is wrong on
+> several points that changed: base release, PGDG as the Postgres source,
+> `/usr/share/dotnet` as `DOTNET_ROOT`, `MALLOC_ARENA_MAX=2`, the Node major, and
+> the sysctl/ulimit set. Trust `README.md` and the `Dockerfile`, not this file.
+
 ## Verbatim Requirements
 
 ### Original Request
