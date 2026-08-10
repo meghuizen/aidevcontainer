@@ -255,5 +255,92 @@ Kernel tunables split by whether they can be namespaced:
 
 ## Image size
 
-~10–13 GB after pre-warm. Major contributors: SQL Server 2025 (~1.7 GB), .NET 10 + 11 SDKs (~1.4 GB), `/opt/venv` Python stack (~1.5 GB), npm globals (~600 MB), Go + Rust (~1.1 GB), Azure CLI + extensions (~600 MB), Playwright browser deps (~150 MB libs only — browsers downloaded on first `playwright install`).
+**Roughly 11 GB.** The apt half is measured exactly; the rest is estimated. Nothing here has been confirmed against a built image yet — run `docker image ls aidev:latest` and the audit commands at the end of this section to replace these numbers with real ones.
+
+### Measured: apt packages — 5.00 GiB
+
+Full dependency closure of the 91 explicitly installed packages (616 packages total), summing `Installed-Size` from the Ubuntu 26.10, Microsoft, and Azure CLI indexes. Excludes `docker-ce-cli` + `docker-compose-plugin` (~130 MB, not in the indexes checked).
+
+The "marginal cost" column is what you actually get back by removing something — the package plus the dependencies nothing else needs:
+
+| Component | Marginal cost | Notes |
+|---|---:|---|
+| `mssql-server` (+ `mssql-tools18`) | **1451 MiB** | Largest single item in the whole image |
+| `azure-cli` | **677 MiB** | apt build bundles its own Python and all deps |
+| `rust-all` | **632 MiB** | `rust-1.93-src` 194 + `libstd-rust-dev` 188 + LLVM 216 |
+| `dotnet-sdk-10.0` | **537 MiB** | Plus runtime and targeting packs |
+| `golang-go` + `gopls` | 254 MiB | `golang-1.26-src` alone is 147 MiB |
+| `ffmpeg` | 215 MiB | Pulls the full codec library set |
+| `libopenblas-dev` | 107 MiB | |
+| `cmake` | 59 MiB | |
+| `libicu-dev` | 50 MiB | |
+| `vim` + `nano` + `tmux` + `tig` + `htop` | 50 MiB | |
+| `postgresql-18` + client | 26 MiB | Genuinely cheap |
+| `tesseract-ocr` + eng data | 21 MiB | |
+| Playwright system libs | 4 MiB | The libs are nearly free; browsers are not |
+
+### Estimated: everything else — ~6 GB
+
+| Component | Size | How it was derived |
+|---|---:|---|
+| `azure-functions-core-tools` | ~600 MiB | 553 MiB release zip, measured |
+| GitHub Actions runner | ~550 MiB | 216 MiB tarball, measured; bundles its own .NET + Node |
+| Azure DevOps agent | ~500 MiB | 207 MiB tarball, measured; same |
+| .NET 11 preview SDK + ASP.NET runtime | ~800 MiB | Estimate from typical SDK tarball size |
+| npm globals | ~450 MiB | Registry `unpackedSize`: `opencode-ai` 175, `happy` 107, `@ast-grep/cli` 51, rest small |
+| Hermes + its Chromium | ~400 MiB | Its installer runs `playwright install --with-deps chromium` |
+| Pre-warm caches (NuGet, Roslyn, LSPs) | ~400 MiB | The point of the image; buys first-run speed |
+| .NET global tools (7) | ~350 MiB | |
+| uv tools (ruff, pyright, mypy, …) | ~350 MiB | Wheels total 46 MiB; each tool gets its own venv |
+| `/opt/venv` Python stack | ~450 MiB | Wheels total ~75 MiB, installed 1.5–2.5× plus transitive deps |
+| Azure CLI extensions | ~300 MiB | 5 extensions incl. `aks-preview` |
+| uv-managed Python 3.11 + 3.14 | ~250 MiB | Two standalone builds |
+| tree-sitter grammars (10 clones) | ~200 MiB | Source only, not compiled |
+| Standalone binaries | ~100 MiB | duckdb 20, rust-analyzer 14, lazygit, delta, yt-dlp, rtk |
+
+### Trimming it
+
+**Free wins — no capability lost (~250 MB):**
+
+- `libopenblas-dev` → drop it. NumPy's wheels bundle their own OpenBLAS; the `-dev` package is only needed to *compile* against BLAS. Saves 107 MiB.
+- `libicu-dev` → drop it. .NET needs the runtime `libicu78`, which comes in anyway as a dependency. Saves 50 MiB.
+- Trim the tree-sitter grammar clones to the languages you actually use, or drop them — `tree-sitter-cli` can fetch a grammar on demand. Saves up to 200 MiB.
+- Drop whichever of the four agent CLIs you don't use. `opencode-ai` is 175 MiB and `happy` is 107 MiB; each is a one-line `npm i -g` when wanted.
+
+**Biggest win, and worth it — SQL Server as a sidecar (~1.45 GB):**
+
+`mssql-server` is 1.45 GB baked into an image you rebuild often. Running it as a second compose service from `mcr.microsoft.com/mssql/server:2025-latest` is Microsoft's supported arrangement: the image is pulled once and cached outside your rebuild loop, upgrades independently, and a corrupted instance is `docker compose rm` rather than a rebuild. Keep `mssql-tools18` (5 MiB) in the dev container for `sqlcmd`. This also removes `scripts/start-mssql.sh` and the `mssql.conf` handling.
+
+**Build agents — drop unless you self-host (~1.05 GB):**
+
+The Azure DevOps agent and GitHub Actions runner are ~1 GB together, each bundling its own .NET and Node, and **both self-update on registration anyway** — so the baked-in version is discarded the first time you configure one. Replace with a download-on-demand step inside `start-azp-agent.sh` / `start-gh-runner.sh`. Biggest saving for the least loss in the whole image.
+
+**Real tradeoffs — only if you don't use them:**
+
+| Drop | Saves | You lose |
+|---|---:|---|
+| .NET 11 preview SDK | ~800 MiB | Targeting .NET 11; .NET 10 SDK stays |
+| `azure-functions-core-tools` | ~600 MiB | Local Functions host. Reinstallable via npm |
+| `rust-all` → `rustc cargo rustfmt clippy` | ~250 MiB | `rust-src` (worse rust-analyzer completion) and Rust docs |
+| `golang-go` + `gopls` | ~254 MiB | Go entirely |
+| `ffmpeg` | ~215 MiB | Audio/video transcode; needed for whisper-style workflows |
+| Hermes | ~400 MiB | The Hermes agent, and the trickiest step in the build |
+| `azure-cli` apt → `uv tool install azure-cli` | ~300 MiB | Shares the system Python instead of bundling one. Less battle-tested |
+
+Doing the two structural changes (SQL Server sidecar, on-demand agents) plus the free wins takes the image from ~11 GB to **roughly 8 GB with no loss of function**. Adding the .NET 11 and Functions-tools cuts gets it near 6.5 GB.
+
+**What not to cut:** the pre-warm caches and PostgreSQL. The caches are the reason the container is fast on first use, and Postgres is 26 MiB — cheaper than the paragraph describing it.
+
+### Auditing the real image
+
+```bash
+docker image ls aidev:latest                       # total
+docker history --no-trunc --human aidev:latest      # cost per layer
+# inside the container — biggest directories
+docker compose -f .devcontainer/docker-compose.yml run --rm dev \
+  sudo du -xh --max-depth=2 / 2>/dev/null | sort -rh | head -40
+# biggest installed apt packages
+docker compose -f .devcontainer/docker-compose.yml run --rm dev \
+  dpkg-query -Wf '${Installed-Size}\t${Package}\n' | sort -rn | head -30
+```
 
