@@ -8,6 +8,13 @@
 #
 # Works from inside the dev container (the host docker socket is mounted) and
 # from the host.
+#
+# Every compose call below names the `mssql` service explicitly, and that matters
+# when running from inside the dev container: compose resolves the dev service's
+# relative bind mount (`../:/workspaces/aidevcontainer`) against the compose
+# file's directory, which in here is an *in-container* path. Acting on `dev` from
+# inside would hand that path to the host daemon and produce a broken container.
+# Never run a bare `docker compose up` from inside the dev container.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=_lib.sh

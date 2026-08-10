@@ -141,6 +141,8 @@ sqlcmd -S mssql,1433 -U sa -P "$(cat ~/.mssql-password)" -No
 
 Port 1433 is still published to the host, so host-side tools (SSMS, Azure Data Studio) reach it at `localhost,1433` as before. Set `MSSQL_HOST` to override the hostname the scripts use.
 
+> **Never run a bare `docker compose up` from inside the dev container.** Compose resolves the dev service's relative bind mount (`../:/workspaces/aidevcontainer`) against the compose file's directory — an in-container path — and would hand that to the host daemon, producing a dev container with an empty workspace. Always name the service (`up -d mssql`), which is what `start-mssql.sh` and `stop-all.sh` do, or run compose from the host.
+
 The old `config/mssql.conf` is gone; the equivalent settings are `MSSQL_*` environment variables on the service (`MSSQL_MEMORY_LIMIT_MB`, `MSSQL_TCP_PORT`, `MSSQL_LCID`, `MSSQL_PID`). One setting did not survive the move: `customerfeedback = false`. The official container image has no documented environment variable for it, so telemetry is at the image's default.
 
 The SA password comes from `MSSQL_SA_PASSWORD` in the environment (the script exports it from `~/.mssql-password`) and is baked into the container at creation. Changing it later means `docker compose -f .devcontainer/docker-compose.yml rm -f mssql` and starting again — the `mssql-data` volume survives that, so your databases do too. Starting the service by hand without that variable set makes the SQL Server image refuse to start; check `docker compose logs mssql`.
