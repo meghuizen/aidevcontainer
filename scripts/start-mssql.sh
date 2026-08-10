@@ -154,14 +154,36 @@ if ! getent hosts "$SQL_HOST" >/dev/null 2>&1; then
   dump_logs_and_die "mssql: logs follow"
 fi
 
-# A fresh data volume takes a while: the engine creates master/model/msdb.
-export SQLCMDPASSWORD="$MSSQL_SA_PASSWORD"
-if ! aidev_wait_until mssql 90 2 \
-      "$SQLCMD" -S "${SQL_HOST},1433" -U sa -No -Q "SELECT 1"; then
-  dump_logs_and_die "mssql: timed out waiting for the engine — logs follow"
-fi
-unset SQLCMDPASSWORD
+# Wait for the engine — a fresh data volume takes a while, since it has to create
+# master/model/msdb.
+#
+# Every password we know about is tried, not just the one handed to compose. They
+# can legitimately differ: if the password was rotated in-engine, master.mdf
+# accepts the rotated value while the container's env still carries the original.
+# We must START with the container's value (or compose recreates it), but the
+# engine may only ACCEPT the other one.
+candidates=("$file_pw")
+[[ -n "$baked_pw" && "$baked_pw" != "$file_pw" ]] && candidates+=("$baked_pw")
 
-[[ "$MSSQL_SA_PASSWORD" == "$file_pw" ]] || save_password "$MSSQL_SA_PASSWORD"
-echo "mssql: ready. Connect with:"
+winner=""
+for (( attempt = 1; attempt <= 90; attempt++ )); do
+  for pw in "${candidates[@]}"; do
+    if try_login "$pw"; then
+      winner="$pw"
+      break 2
+    fi
+  done
+  sleep 2
+done
+
+[[ -n "$winner" ]] || dump_logs_and_die "mssql: timed out waiting for the engine — logs follow"
+echo "mssql: ready"
+
+# Save only the password that actually authenticated, never the one we guessed.
+if [[ "$winner" != "$file_pw" ]]; then
+  save_password "$winner"
+  echo "mssql: the working SA password differed from $PWFILE — updated it"
+fi
+
+echo "mssql: connect with"
 echo "  SQLCMDPASSWORD=\"\$(cat $PWFILE)\" sqlcmd -S ${SQL_HOST},1433 -U sa -No"
