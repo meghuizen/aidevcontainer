@@ -22,6 +22,12 @@ if command -v dotnet >/dev/null 2>&1; then
   # used by Firefox/Chrome. Idempotent — silent if already trusted.
   dotnet dev-certs https --trust >/dev/null 2>&1 || \
     echo "prewarm: dev-certs trust skipped (non-fatal)"
+
+  # SOS for lldb: writes ~/.dotnet/sos and an ~/.lldbinit that loads it, so
+  # `lldb -p <pid>` / `lldb --core <dump>` understand managed stacks right away.
+  if command -v dotnet-sos >/dev/null 2>&1; then
+    dotnet-sos install >/dev/null 2>&1 || echo "prewarm: dotnet-sos install skipped (non-fatal)"
+  fi
 fi
 
 # --- Python / pyright ---

@@ -2,11 +2,10 @@
 ###############################################################################
 # ai-dev container — Ubuntu 26.10 (stonking)
 #
-# NOTE: 26.10 is a non-LTS interim release. At the time of writing it is still
-# in development (GA October 2026), so `ubuntu:26.10` is a moving snapshot and
-# third-party apt repos mostly do not publish a `stonking` suite yet. Only the
-# Docker repo probes for a matching suite; Microsoft is pinned to `noble`,
-# GitHub CLI uses `stable`, and NodeSource uses its distro-less `nodistro`.
+# NOTE: 26.10 is a non-LTS interim release (GA 2026-10-15). Third-party apt
+# repos mostly do not publish a `stonking` suite. The Docker repo probes for a
+# matching suite; Azure CLI uses the 26.04 `resolute` suite, GitHub CLI uses
+# `stable`, and NodeSource uses its distro-less `nodistro`.
 #
 # amd64v3: Ubuntu 26.10 publishes a second set of binaries built for the
 # x86-64-v3 microarchitecture level (AVX2/FMA/BMI2 — Intel Haswell / AMD
@@ -16,38 +15,43 @@
 # pre-2013 CPU — v3 binaries crash with SIGILL there.
 #
 # Single-stage build: ONE consolidated `apt-get install` for every native package
-# the image needs (build deps + runtime tools + language runtimes + DBs +
+# the image needs (build deps + runtime tools + language runtimes +
 # Playwright libs). Subsequent RUN steps build on top using those tools.
 #
 # Order:
 #   1. ENV (telemetry off, locale, performance defaults)
 #   2. Bootstrap apt (amd64v3 opt-in, apt/dpkg tuning, full-upgrade, repo keys)
-#   3. Third-party apt repos (Microsoft, GitHub CLI, Docker, NodeSource)
-#   4. ONE BIG apt install (build/runtime utilities + .NET 10 + Node + Python + DBs + Playwright libs)
+#   3. Third-party apt repos (Azure CLI, GitHub CLI, Docker, NodeSource)
+#   4. ONE BIG apt install (build/runtime utilities + .NET 10 + 11 + Node + Python + Playwright libs)
 #   5. vscode user (UID 1000) + system PATH profile
-#   6. .NET global tools (Roslynator, Aspire CLI, csharp-ls, …) — against stable .NET 10 SDK
-#   7. .NET 11 SDK side-by-side via dotnet-install.sh
+#   6. .NET global tools (Roslynator, Aspire CLI, csharp-ls, …)
+#   7. (removed — .NET 11 now comes from the Ubuntu archive in step 4)
 #   8. npm prefix + corepack + npm global packages (azurite, Claude Code, Codex, …)
-#   9. uv + uv-managed Python 3.11 / 3.14 + uv tools + /opt/venv
+#   9. uv + uv tools (incl. yt-dlp) + /opt/venv — all on the ONE system python3
 #  10. Az CLI extensions
-#  11. Standalone binaries (yt-dlp, rust-analyzer, DuckDB, delta, lazygit, RTK, Hermes)
+#  11. Standalone binaries (fff-mcp, sqlcmd, repo, rust-analyzer, DuckDB, delta,
+#      lazygit, Hermes, hadolint, RTK) — netcoredbg sits with the .NET tools in step 6
 #  12. Build agents (Azure DevOps, GitHub Actions runner)
 #  13. tree-sitter grammars + ast-grep rule packs
 #  14. fix-docker-perms + entrypoint + resource limits (ulimit/sysctl)
-#  15. Project scripts/configs + prewarm
+#  15. Project scripts/configs + prewarm + Playwright Chromium
 #  16. Validation
 #  17. USER vscode + ENTRYPOINT
 ###############################################################################
 
 ARG UBUNTU_TAG=26.10
-ARG GH_RUNNER_VERSION=2.336.0
-ARG AZP_AGENT_VERSION=5.277.0
+ARG GH_RUNNER_VERSION=2.338.2
+ARG AZP_AGENT_VERSION=5.282.0
 ARG RTK_VERSION=
+# fff-mcp release tag (e.g. v0.11.0). Empty = latest GitHub release.
+ARG FFF_VERSION=
+# go-sqlcmd release tag (e.g. v1.11.0). Empty = latest GitHub release.
+ARG SQLCMD_VERSION=
 ARG NODE_MAJOR=26
 # NodeSource lags nodejs.org by a release or two — pin to the newest version its
 # node_26.x repo actually publishes, or the madison lookup in step 4 silently
 # falls back to unpinned `nodejs`.
-ARG NODE_VERSION=26.6.0
+ARG NODE_VERSION=26.13.1
 ARG ENABLE_AMD64V3=1
 
 FROM ubuntu:${UBUNTU_TAG}
@@ -57,6 +61,8 @@ ARG NODE_VERSION
 ARG GH_RUNNER_VERSION
 ARG AZP_AGENT_VERSION
 ARG RTK_VERSION
+ARG FFF_VERSION
+ARG SQLCMD_VERSION
 ARG ENABLE_AMD64V3
 ARG UBUNTU_TAG
 
@@ -82,6 +88,31 @@ ARG UBUNTU_TAG
 #                              Unrelated to the astral `uv` UV_* vars above.
 #   UV_COMPILE_BYTECODE=1      astral uv: pre-compiles .pyc at install time so
 #                              first import of an installed package is not slow.
+#
+# Agent harness:
+#   AIDEV_DATA_DIR=/data       Mount point of the data folder (all source code +
+#                              working environment). fff-mcp indexes it.
+#   CLAUDE_CONFIG_DIR          Moves ~/.claude.json (auth, onboarding, user-scope
+#                              MCP servers) INTO ~/.claude, which is a named
+#                              volume — so logins survive a container rebuild.
+#   DISABLE_AUTOUPDATER=1      Agent CLIs are image-managed (npm prefix /usr/local
+#                              is root-owned); rebuild to upgrade.
+#   PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-x64
+#                              Older Playwright releases (pinned by projects,
+#                              incl. Microsoft.Playwright for .NET) have no
+#                              ubuntu26.x entry in their download map. The
+#                              Chromium build is identical across 24.04/26.04.
+#   PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+#                              Browsers live in the IMAGE, not on a volume: a
+#                              volume would freeze the first image's browsers and
+#                              hide the ones a rebuilt image ships (e.g. for a
+#                              newer Playwright MCP). vscode-owned, so project-
+#                              pinned revisions can still be added at runtime.
+#
+# One Python: Ubuntu's apt python3 (3.14 on 26.10, amd64v3 build). apt needs it
+# anyway, so it is the only interpreter that can be "the one".
+# UV_PYTHON_DOWNLOADS=never + UV_PYTHON_PREFERENCE=only-system stop uv from
+# quietly fetching a second CPython for a project.
 #-----------------------------------------------------------------------------
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=en_US.UTF-8 \
@@ -90,6 +121,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TZ=Etc/UTC \
     DOTNET_CLI_TELEMETRY_OPTOUT=1 \
     DOTNET_NOLOGO=1 \
+    DOTNET_CLI_UI_LANGUAGE=en \
     NUGET_XMLDOC_MODE=skip \
     POWERSHELL_TELEMETRY_OPTOUT=1 \
     AZURE_CORE_COLLECT_TELEMETRY=no \
@@ -100,11 +132,20 @@ ENV DEBIAN_FRONTEND=noninteractive \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility,video \
     PNPM_HOME=/home/vscode/.local/share/pnpm \
     PNPM_STORE_DIR=/home/vscode/.cache/pnpm \
-    PLAYWRIGHT_BROWSERS_PATH=/home/vscode/.cache/ms-playwright \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
     PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=1 \
+    PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-x64 \
+    NG_CLI_ANALYTICS=false \
+    ASPIRE_CLI_TELEMETRY_OPTOUT=1 \
+    POWERSHELL_UPDATECHECK=Off \
+    CLAUDE_CONFIG_DIR=/home/vscode/.claude \
+    DISABLE_AUTOUPDATER=1 \
+    CODEX_HOME=/home/vscode/.codex \
+    AIDEV_DATA_DIR=/data \
     UV_TOOL_DIR=/opt/uv-tools \
     UV_TOOL_BIN_DIR=/opt/uv-tools/bin \
-    UV_PYTHON_INSTALL_DIR=/opt/uv-pythons \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_PYTHON_PREFERENCE=only-system \
     UV_HTTP_TIMEOUT=300 \
     UV_LINK_MODE=copy \
     AZURE_EXTENSION_DIR=/opt/az-extensions \
@@ -165,31 +206,22 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 #-----------------------------------------------------------------------------
 # 3. Third-party apt repos (signed-by keyrings)
 #-----------------------------------------------------------------------------
-# Microsoft: mssql-server, mssql-tools18/msodbcsql18, Azure CLI.
-# Deliberately still pinned to the noble (24.04) suites — Microsoft publishes no
-# 26.10 suite, and its 26.04 "prod" feed carries only moby/kubernetes packages,
-# not the SQL tooling. The noble debs install cleanly on 26.10 (their deps —
-# libssl3t64, libicu78, unixodbc — all exist there).
+# Microsoft: Azure CLI only. Microsoft publishes no 26.10 suite; the 26.04
+# `resolute` suite is the closest. (SQL Server / mssql-tools are no longer in the
+# image, so the microsoft-prod and mssql-server feeds are gone.)
 #
-# .NET is NOT taken from Microsoft any more: Ubuntu's own archive ships
-# dotnet-sdk-10.0 (10.0.109-0ubuntu1) with an amd64v3 build, which the Microsoft
-# feed does not. As of now the noble feed carries no .NET packages at all, but the
-# pin below makes that independent of Microsoft's future publishing choices —
-# otherwise a Microsoft `10.0.x-1` revision would out-rank Ubuntu's `-0ubuntu1`
+# .NET is NOT taken from Microsoft: Ubuntu's own archive ships dotnet-sdk-10.0
+# and dotnet-sdk-11.0 with amd64v3 builds. The pin below keeps it that way —
+# otherwise a Microsoft `x.y-1` revision would out-rank Ubuntu's `-0ubuntu1`
 # and install to /usr/share/dotnet, breaking DOTNET_ROOT.
 RUN curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
       | gpg --dearmor -o /etc/apt/keyrings/microsoft.gpg \
  && chmod 0644 /etc/apt/keyrings/microsoft.gpg \
- && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/ubuntu/24.04/prod noble main" \
-      > /etc/apt/sources.list.d/microsoft-prod.list \
- && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/ubuntu/24.04/mssql-server-2025 noble main" \
-      > /etc/apt/sources.list.d/mssql-server-2025.list \
- && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/azure-cli/ noble main" \
+ && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/azure-cli/ resolute main" \
       > /etc/apt/sources.list.d/azure-cli.list
 
 # Keep .NET on the Ubuntu archive no matter what Microsoft publishes. Scoped to
-# dotnet/aspnetcore only — mssql-tools18, msodbcsql18 and azure-cli still come
-# from Microsoft and are unaffected.
+# dotnet/aspnetcore only — azure-cli still comes from Microsoft.
 COPY <<'EOF' /etc/apt/preferences.d/no-microsoft-dotnet
 Package: dotnet* aspnetcore*
 Pin: origin packages.microsoft.com
@@ -223,25 +255,10 @@ RUN curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
  && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main" \
       > /etc/apt/sources.list.d/nodesource.list
 
-# PostgreSQL: no PGDG repo. Ubuntu 26.10 main ships postgresql-18 itself (with an
-# amd64v3 build), so PGDG would only add a second origin for the same major — two
-# sources racing over one `postgresql-18` package, which is exactly what we don't
-# want. Single origin: the Ubuntu archive.
-#
-# Stop postgresql-common's postinst from auto-creating the 18/main cluster at BUILD
-# time. Its cluster keeps postgresql.conf under /etc/postgresql/18/main, but
-# scripts/start-postgres.sh installs this repo's config INTO the data dir and
-# starts postgres with `-c config_file=$PG_DATA/postgresql.conf`. With an
-# auto-created cluster the script sees a populated PG_DATA, skips its init branch,
-# never installs the config, and postgres then dies on a missing config_file.
-# Letting the script run initdb itself is the arrangement it was written for.
-RUN install -d -m 0755 /etc/postgresql-common \
- && echo 'create_main_cluster = false' > /etc/postgresql-common/createcluster.conf
-
 #-----------------------------------------------------------------------------
 # 4. THE big apt install — every native package the image needs.
 #    Bootstrap layer + repos already added; this is one apt-get install for
-#    base utilities, language runtimes, DBs, and Playwright deps.
+#    base utilities, language runtimes, and Playwright deps.
 #
 #    26.10 rename/removal notes vs 26.04:
 #      libmagic1 -> libmagic1t64 (64-bit time_t transition)
@@ -251,7 +268,7 @@ RUN install -d -m 0755 /etc/postgresql-common \
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     set -eux; \
-    export ACCEPT_EULA=Y MSSQL_PID=Developer DEBIAN_FRONTEND=noninteractive; \
+    export DEBIAN_FRONTEND=noninteractive; \
     apt-get update; \
     NODEJS_PKG="$(apt-cache madison nodejs | awk -v v="${NODE_VERSION}" '$3 ~ v {print "nodejs="$3; exit}')"; \
     : "${NODEJS_PKG:=nodejs}"; \
@@ -259,6 +276,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         apt-transport-https \
         bash-completion \
         build-essential \
+        bzip2 \
         cmake \
         dirmngr \
         file \
@@ -295,6 +313,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         zstd \
         \
         dotnet-sdk-10.0 \
+        dotnet-sdk-11.0 \
         \
         "$NODEJS_PKG" \
         \
@@ -314,14 +333,25 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         gh \
         golang-go \
         gopls \
-        mssql-server \
-        mssql-tools18 \
+        mysql-client \
         poppler-utils \
-        postgresql-18 \
-        postgresql-client-18 \
-        libpq-dev \
+        postgresql-client \
         rust-all \
         sqlite3 \
+        \
+        lldb \
+        strace \
+        lsof \
+        \
+        shellcheck \
+        hyperfine \
+        gitleaks \
+        yq \
+        pandoc \
+        graphviz \
+        \
+        fonts-liberation \
+        fonts-noto-color-emoji \
         libopenblas-dev \
         libnss3 \
         libnss3-tools \
@@ -344,7 +374,6 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         tesseract-ocr \
         tesseract-ocr-eng \
         tree-sitter-cli \
-        unixodbc-dev \
         zoxide; \
     ln -sf /usr/bin/fdfind /usr/local/bin/fd; \
     ln -sf /usr/bin/batcat /usr/local/bin/bat 2>/dev/null || true; \
@@ -352,7 +381,9 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
       || { echo "dotnet did not land in /usr/lib/dotnet — wrong origin? check apt-cache policy dotnet-sdk-10.0" >&2; \
            apt-cache policy dotnet-sdk-10.0 >&2; exit 1; }; \
     ln -sf /usr/lib/dotnet/dotnet /usr/local/bin/dotnet; \
-    /usr/local/bin/dotnet --list-sdks
+    /usr/local/bin/dotnet --list-sdks; \
+    /usr/local/bin/dotnet --list-sdks | grep -q '^10\.' \
+      && /usr/local/bin/dotnet --list-sdks | grep -q '^11\.'
 
 #-----------------------------------------------------------------------------
 # 5. vscode user (UID 1000). The Ubuntu base image ships `ubuntu` at UID 1000;
@@ -384,34 +415,72 @@ export PATH="/usr/local/dotnet-tools:/opt/uv-tools/bin:/opt/venv/bin:/home/vscod
 EOF
 
 #-----------------------------------------------------------------------------
-# 6. .NET global tools — installed FIRST against the stable .NET 10 SDK so they
-#    don't accidentally resolve against the .NET 11 preview SDK we add next.
+# 6. .NET global tools. Both SDKs (10 + 11) are GA and installed side-by-side in
+#    /usr/lib/dotnet by step 4. `dotnet format` is built into the SDK, so the
+#    deprecated dotnet-format global tool is no longer installed.
+#
+#    Groups: build/quality · diagnostics & debugging (dotnet-dump/-trace/-counters
+#    /-gcdump/-stack, dotnet-sos for lldb) · decompile (ilspycmd) · coverage ·
+#    docs (docfx) · DB (sqlpackage). PowerShell is installed separately below.
 #-----------------------------------------------------------------------------
 RUN --mount=type=cache,target=/root/.nuget,sharing=locked \
-    dotnet tool install --tool-path /usr/local/dotnet-tools Roslynator.DotNet.Cli \
- && dotnet tool install --tool-path /usr/local/dotnet-tools dotnet-ef \
- && dotnet tool install --tool-path /usr/local/dotnet-tools dotnet-format \
- && dotnet tool install --tool-path /usr/local/dotnet-tools dotnet-outdated-tool \
- && dotnet tool install --tool-path /usr/local/dotnet-tools dotnet-script \
- && dotnet tool install --tool-path /usr/local/dotnet-tools csharp-ls \
- && dotnet tool install --tool-path /usr/local/dotnet-tools Aspire.Cli \
- && { dotnet workload update --skip-sign-check && dotnet workload list; } \
+    set -eux; \
+    for t in \
+        Roslynator.DotNet.Cli \
+        csharpier \
+        dotnet-ef \
+        dotnet-outdated-tool \
+        dotnet-script \
+        csharp-ls \
+        Aspire.Cli \
+        dotnet-dump \
+        dotnet-trace \
+        dotnet-counters \
+        dotnet-gcdump \
+        dotnet-stack \
+        dotnet-sos \
+        ilspycmd \
+        dotnet-coverage \
+        dotnet-reportgenerator-globaltool \
+        docfx \
+        microsoft.sqlpackage; \
+    do dotnet tool install --tool-path /usr/local/dotnet-tools "$t"; done; \
+    { dotnet workload update --skip-sign-check && dotnet workload list; } \
       || echo "dotnet workloads: unavailable on this SDK build (non-fatal)"
 
-#-----------------------------------------------------------------------------
-# 7. .NET 11 side-by-side via dotnet-install.sh. Ubuntu 26.10's archive has
-#    dotnet-sdk-10.0 but no dotnet-sdk-11.0, and .NET 11 is still preview.
-#-----------------------------------------------------------------------------
-#    Installed INTO /usr/lib/dotnet — the same root apt uses — because a single
-#    DOTNET_ROOT is what makes `dotnet --list-sdks` show both majors.
-RUN curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh \
- && chmod +x /tmp/dotnet-install.sh \
- && /tmp/dotnet-install.sh --channel 11.0 --quality preview --install-dir /usr/lib/dotnet --no-path \
- && /tmp/dotnet-install.sh --channel 11.0 --quality preview --install-dir /usr/lib/dotnet --runtime aspnetcore --no-path \
- && rm /tmp/dotnet-install.sh \
- && ls /usr/lib/dotnet/sdk \
- && ls /usr/lib/dotnet/shared/Microsoft.AspNetCore.App \
- && dotnet --list-sdks
+# netcoredbg — open-source (MIT) .NET debugger with a CLI, MI and DAP interface.
+# Microsoft's vsdbg is licensed for VS / VS Code only; netcoredbg is what a
+# terminal agent (or any DAP client) can drive. C# Dev Kit keeps using vsdbg.
+RUN set -eux; \
+    META="$(curl -fsSL https://api.github.com/repos/Samsung/netcoredbg/releases/latest)"; \
+    ASSET="netcoredbg-linux-amd64.tar.gz"; \
+    URL="$(echo "$META" | jq -r --arg a "$ASSET" '.assets[] | select(.name==$a) | .browser_download_url')"; \
+    SHA="$(echo "$META" | jq -r --arg a "$ASSET" '.assets[] | select(.name==$a) | .digest' | sed 's/^sha256://')"; \
+    curl -fsSL "$URL" -o /tmp/netcoredbg.tgz; \
+    echo "${SHA}  /tmp/netcoredbg.tgz" | sha256sum -c -; \
+    tar -xzf /tmp/netcoredbg.tgz -C /opt; \
+    ln -sf /opt/netcoredbg/netcoredbg /usr/local/bin/netcoredbg; \
+    rm /tmp/netcoredbg.tgz; \
+    netcoredbg --version
+
+# PowerShell (`pwsh`) — Microsoft.Playwright's `playwright.ps1 install` needs it.
+# From the official self-contained release tarball, NOT the `PowerShell` dotnet
+# global tool: the 7.7 tool package crashes on Linux at startup
+# (PSEtwLogProvider -> DllNotFoundException api-ms-win-eventing-provider).
+RUN set -eux; \
+    META="$(curl -fsSL https://api.github.com/repos/PowerShell/PowerShell/releases/latest)"; \
+    TAG="$(echo "$META" | jq -r .tag_name)"; \
+    ASSET="powershell-${TAG#v}-linux-x64.tar.gz"; \
+    URL="$(echo "$META" | jq -r --arg a "$ASSET" '.assets[] | select(.name==$a) | .browser_download_url')"; \
+    SHA="$(echo "$META" | jq -r --arg a "$ASSET" '.assets[] | select(.name==$a) | .digest' | sed 's/^sha256://')"; \
+    curl -fsSL "$URL" -o /tmp/pwsh.tgz; \
+    echo "${SHA}  /tmp/pwsh.tgz" | sha256sum -c -; \
+    mkdir -p /opt/microsoft/powershell; \
+    tar -xzf /tmp/pwsh.tgz -C /opt/microsoft/powershell; \
+    chmod +x /opt/microsoft/powershell/pwsh; \
+    ln -sf /opt/microsoft/powershell/pwsh /usr/local/bin/pwsh; \
+    rm /tmp/pwsh.tgz; \
+    pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
 
 #-----------------------------------------------------------------------------
 # 8. npm config + corepack + global npm packages
@@ -429,13 +498,21 @@ RUN npm config set prefix /usr/local --location=global \
  && corepack prepare yarn@stable --activate \
  && pnpm --version && yarn --version && npm --version
 
+# No --prefer-offline: with a warm BuildKit cache it would happily reinstall a
+# stale cached version. Agent CLIs move weekly — always resolve @latest.
 RUN --mount=type=cache,target=/root/.npm,sharing=locked \
-    npm install -g --no-audit --no-fund --prefer-offline \
+    npm install -g --no-audit --no-fund \
         azurite \
         azure-functions-core-tools@4 \
-        @anthropic-ai/claude-code \
-        @openai/codex \
-        opencode-ai \
+        @anthropic-ai/claude-code@latest \
+        @openai/codex@latest \
+        opencode-ai@latest \
+        @github/copilot@latest \
+        happy@latest \
+        @colbymchenry/codegraph@latest \
+        @playwright/mcp@latest \
+        @angular/cli@latest \
+        @angular/language-server \
         typescript \
         typescript-language-server \
         vscode-langservers-extracted \
@@ -443,43 +520,42 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
         yaml-language-server \
         dockerfile-language-server-nodejs \
         sql-language-server \
-        @ast-grep/cli \
-        playwright \
-        @playwright/cli \
-        happy
+        markdownlint-cli2 \
+        @ast-grep/cli
 
 #-----------------------------------------------------------------------------
-# 9. uv + Python 3.11 + 3.14 + uv tools + /opt/venv
+# 9. uv + uv tools + /opt/venv — everything on the single apt python3.
+#    No uv-managed CPythons: UV_PYTHON_DOWNLOADS=never (ENV) enforces that.
 #-----------------------------------------------------------------------------
 RUN curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh \
- && /usr/local/bin/uv --version && /usr/local/bin/uvx --version
+ && /usr/local/bin/uv --version && /usr/local/bin/uvx --version \
+ && uv python find
 
-# Preinstall Python 3.11 and 3.14 alongside Ubuntu's apt python3.
-RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
-    uv python install 3.11 3.14 \
- && uv python find 3.11 \
- && uv python find 3.14
-
-# Expose uv-managed Pythons as python3.11 / python3.14 on PATH.
-RUN set -eux; \
-    for ver in 3.11 3.14; do \
-        PY="$(find /opt/uv-pythons -maxdepth 4 -type f -name "python${ver}" -executable 2>/dev/null | head -n1)"; \
-        [ -x "$PY" ] || { echo "uv python ${ver} not found under /opt/uv-pythons" >&2; exit 1; }; \
-        ln -sf "$PY" "/usr/local/bin/python${ver}"; \
-        "/usr/local/bin/python${ver}" --version; \
-    done
-
-# uv-managed dev tools (resolved against the apt-installed system python3)
+# uv-managed dev tools. yt-dlp[default] pulls in yt-dlp-ejs (YouTube's JS
+# challenge solver scripts) and the optional deps (curl-cffi, mutagen, …); as a
+# uv tool it upgrades with `uv tool upgrade yt-dlp` like everything else here.
 RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     mkdir -p /opt/uv-tools/bin \
- && uv tool install ruff \
- && uv tool install pyright \
- && uv tool install basedpyright \
- && uv tool install mypy \
- && uv tool install pytest \
- && uv tool install ipython \
- && uv tool install python-lsp-server \
- && uv tool install pre-commit
+ && uv tool install --python /usr/bin/python3 ruff \
+ && uv tool install --python /usr/bin/python3 pyright \
+ && uv tool install --python /usr/bin/python3 basedpyright \
+ && uv tool install --python /usr/bin/python3 mypy \
+ && uv tool install --python /usr/bin/python3 pytest \
+ && uv tool install --python /usr/bin/python3 ipython \
+ && uv tool install --python /usr/bin/python3 python-lsp-server \
+ && uv tool install --python /usr/bin/python3 pre-commit \
+ && uv tool install --python /usr/bin/python3 "yt-dlp[default]" \
+ && uv tool install --python /usr/bin/python3 "markitdown[all]" \
+ && uv tool install --python /usr/bin/python3 semgrep \
+ && yt-dlp --version \
+ && markitdown --help >/dev/null \
+ && semgrep --version
+
+# yt-dlp needs a JavaScript runtime for YouTube. It only enables deno by default;
+# Node is already in the image, so point it there instead of adding deno.
+COPY <<'EOF' /etc/yt-dlp.conf
+--js-runtimes node
+EOF
 
 # Prebuilt venv at /opt/venv with the doc / AI / MCP stack.
 # openai-whisper / faster-whisper / whisper.cpp intentionally NOT installed
@@ -521,10 +597,40 @@ RUN mkdir -p /opt/az-extensions \
 #-----------------------------------------------------------------------------
 # 11. Standalone binaries (curl + extract pattern)
 #-----------------------------------------------------------------------------
-# yt-dlp (self-contained Python zipapp from upstream releases)
-RUN curl -fsSL "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp" -o /usr/local/bin/yt-dlp \
- && chmod +x /usr/local/bin/yt-dlp \
- && yt-dlp --version
+# fff-mcp — the default file finder / content indexer for every agent in the
+# image (registered per user by scripts/setup-agents.sh at container create).
+# Static musl build, same artifact the upstream install-mcp.sh picks, verified
+# against the release's .sha256. Updates come with the image, so the runtime
+# self-update check is switched off where it is registered (--no-update-check).
+RUN set -eux; \
+    if [ -n "${FFF_VERSION}" ]; then TAG="${FFF_VERSION}"; \
+    else TAG="$(curl -fsSL https://api.github.com/repos/dmtrKovalenko/fff/releases/latest | jq -r .tag_name)"; fi; \
+    ASSET="fff-mcp-x86_64-unknown-linux-musl"; \
+    BASE="https://github.com/dmtrKovalenko/fff/releases/download/${TAG}"; \
+    curl -fsSL "${BASE}/${ASSET}" -o /tmp/fff-mcp; \
+    EXPECTED="$(curl -fsSL "${BASE}/${ASSET}.sha256" | awk '{print $1}')"; \
+    echo "${EXPECTED}  /tmp/fff-mcp" | sha256sum -c -; \
+    install -m 0755 /tmp/fff-mcp /usr/local/bin/fff-mcp; \
+    rm /tmp/fff-mcp; \
+    fff-mcp --version
+
+# sqlcmd — the Go rewrite (microsoft/go-sqlcmd): one static binary, no ODBC
+# driver, no Microsoft apt feed. Verified against the sha256 digest GitHub
+# records for the release asset. Database CLIENTS only — there are no DB
+# servers in this image (psql and mysql come from apt in step 4).
+RUN set -eux; \
+    if [ -n "${SQLCMD_VERSION}" ]; then REL="tags/${SQLCMD_VERSION}"; else REL="latest"; fi; \
+    ASSET="sqlcmd-linux-amd64.tar.bz2"; \
+    META="$(curl -fsSL "https://api.github.com/repos/microsoft/go-sqlcmd/releases/${REL}")"; \
+    URL="$(echo "$META" | jq -r --arg a "$ASSET" '.assets[] | select(.name==$a) | .browser_download_url')"; \
+    SHA="$(echo "$META" | jq -r --arg a "$ASSET" '.assets[] | select(.name==$a) | .digest' | sed 's/^sha256://')"; \
+    curl -fsSL "$URL" -o /tmp/sqlcmd.tar.bz2; \
+    echo "${SHA}  /tmp/sqlcmd.tar.bz2" | sha256sum -c -; \
+    mkdir /tmp/sqlcmd; \
+    tar -xjf /tmp/sqlcmd.tar.bz2 -C /tmp/sqlcmd; \
+    install -m 0755 /tmp/sqlcmd/sqlcmd /usr/local/bin/sqlcmd; \
+    rm -rf /tmp/sqlcmd /tmp/sqlcmd.tar.bz2; \
+    sqlcmd --version
 
 # repo (Android multi-repository tool). Ubuntu 26.10 dropped the `repo` package;
 # this is the official launcher script, which needs only python3.
@@ -566,34 +672,35 @@ RUN set -eux; \
     rm /tmp/lz.tgz; \
     lazygit --version
 
-# Hermes agent (NousResearch). Two installer-environment hacks needed:
-#  - Force HTTPS for git clones — installer tries SSH first, no credentials in build env.
-#  - Spoof /etc/os-release as Ubuntu 24.04 for the duration of the install. The installer
-#    runs `npx playwright install --with-deps chromium`; Playwright's binary-host map
-#    doesn't include ubuntu26.10-x64 yet and rejects with "does not support chromium on
-#    ubuntu26.10-x64". Pretending to be 24.04 (noble) lets the Chromium download proceed
-#    against the apt deps we already installed (libnss3, libcups2t64, libatk*t64, etc.).
-#    /etc/os-release is restored after the install so `lsb_release -a` etc. report 26.10.
+# Hermes agent (NousResearch). The installer clones over SSH first, and there are
+# no credentials in the build env — force HTTPS. Its `npx playwright install`
+# step is covered by PLAYWRIGHT_HOST_PLATFORM_OVERRIDE (ENV), so the old
+# /etc/os-release spoof is gone.
 RUN set -eux; \
     install -d -m 0755 /opt/hermes-install; \
     git config --system url."https://github.com/".insteadOf "git@github.com:"; \
     git config --system url."https://github.com/".insteadOf "ssh://git@github.com/"; \
-    cp /etc/os-release /etc/os-release.real; \
-    sed -i 's/^VERSION_ID=.*/VERSION_ID="24.04"/; \
-            s/^VERSION_CODENAME=.*/VERSION_CODENAME=noble/; \
-            s/^UBUNTU_CODENAME=.*/UBUNTU_CODENAME=noble/; \
-            s/^VERSION="[^"]*"/VERSION="24.04 LTS (Noble Numbat)"/; \
-            s/^PRETTY_NAME=.*/PRETTY_NAME="Ubuntu 24.04 LTS"/' /etc/os-release; \
     HOME=/opt/hermes-install bash -c \
         'curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash' \
     || true; \
-    mv -f /etc/os-release.real /etc/os-release; \
     if [ ! -x /usr/local/bin/hermes ]; then \
         BIN="$(find /opt/hermes-install /root /usr/local -maxdepth 5 -type f -name hermes -executable 2>/dev/null | head -n1)"; \
         if [ -n "$BIN" ]; then install -m 0755 "$BIN" /usr/local/bin/hermes; \
         else echo "hermes: install.sh did not produce a hermes binary" >&2; exit 1; fi; \
     fi; \
     test -x /usr/local/bin/hermes
+
+# hadolint (Dockerfile linter) — not in the Ubuntu archive.
+RUN set -eux; \
+    META="$(curl -fsSL https://api.github.com/repos/hadolint/hadolint/releases/latest)"; \
+    ASSET="hadolint-linux-x86_64"; \
+    URL="$(echo "$META" | jq -r --arg a "$ASSET" '.assets[] | select(.name==$a) | .browser_download_url')"; \
+    SHA="$(echo "$META" | jq -r --arg a "$ASSET" '.assets[] | select(.name==$a) | .digest' | sed 's/^sha256://')"; \
+    curl -fsSL "$URL" -o /tmp/hadolint; \
+    echo "${SHA}  /tmp/hadolint" | sha256sum -c -; \
+    install -m 0755 /tmp/hadolint /usr/local/bin/hadolint; \
+    rm /tmp/hadolint; \
+    hadolint --version
 
 # RTK (Rust Token Killer)
 RUN set -eux; \
@@ -677,16 +784,15 @@ RUN chmod +x /usr/local/bin/aidev-entrypoint
 # Two separate mechanisms, both needed:
 #
 #  a) limits.d — pam_limits, which only runs for *login-ish* sessions (`su`,
-#     `sudo -i`, ssh). It is what raises limits for the DB servers we start via
-#     `sudo -u postgres` / `sudo -u mssql`.
+#     `sudo -i`, ssh, `sudo -u <user>`).
 #  b) profile.d — raises each interactive shell's SOFT limit to its HARD limit.
 #     A `docker exec` does not go through PAM, so it inherits whatever the
 #     container was created with; the hard ceiling itself comes from the Docker
 #     daemon, i.e. the `ulimits:` block in .devcontainer/docker-compose.yml.
 #
 # nofile is the one that actually bites: pnpm/node watchers, Roslyn, and
-# ripgrep all burn file descriptors fast. memlock matters for SQL Server's
-# locked pages and for io_uring. core=0 stops multi-GB core dumps from .NET or
+# ripgrep/fff-mcp all burn file descriptors fast. memlock matters for io_uring
+# and fff-mcp's mmap'd content cache. core=0 stops multi-GB core dumps from .NET or
 # Chromium filling the container's writable layer.
 #-----------------------------------------------------------------------------
 # Values must match the compose `ulimits:` block — the container ceiling always
@@ -734,7 +840,7 @@ EOF
 # deliberately NOT here: compose `sysctls:` owns those, one home per number.
 COPY <<'EOF' /etc/sysctl.d/90-aidev.conf
 # File watching — VS Code, dotnet watch, vite, and pnpm all register watches.
-fs.inotify.max_user_watches=524288
+fs.inotify.max_user_watches=1048576
 fs.inotify.max_user_instances=8192
 fs.file-max=2097152
 # Many small mmaps: .NET, JVM-style tooling, Chromium.
@@ -749,18 +855,53 @@ EOF
 COPY scripts /opt/aidev/scripts
 COPY tests   /opt/aidev/tests
 COPY config  /opt/aidev/config
+# `setup-agents` on PATH so it can be re-run by hand after wiping ~/.claude etc.
+RUN ln -sf /opt/aidev/scripts/setup-agents.sh /usr/local/bin/setup-agents
 RUN chmod +x /opt/aidev/scripts/*.sh /opt/aidev/tests/*.sh
 
-# Pre-create vscode home subdirs and pre-warm analyzer caches in one pass.
-# `sudo` resets PATH to its `secure_path`, stripping our /usr/local/dotnet-tools and
-# /opt/uv-tools/bin entries — the script's `command -v` checks would silently skip those
-# tools. Pass PATH explicitly via `env` so the prewarm actually covers what we installed.
+# Pre-create every vscode home dir that compose mounts a named volume on. A
+# volume created over a path that does NOT exist in the image comes up
+# root-owned, and the agent CLIs then cannot write their config/auth. Existing,
+# vscode-owned dirs are copied into a fresh volume with their ownership intact.
+#
+# `sudo` resets the environment (PATH to `secure_path`, and drops DOTNET_ROOT,
+# PLAYWRIGHT_*, …). Pass what each step needs explicitly via `env`.
 RUN mkdir -p /home/vscode/.cache /home/vscode/.local/share /home/vscode/.config \
             /home/vscode/.nuget /home/vscode/.dotnet /home/vscode/.npm /home/vscode/.azure \
-            /home/vscode/.claude /home/vscode/.cache/uv /home/vscode/.cache/huggingface \
+            /home/vscode/.claude /home/vscode/.codex /home/vscode/.copilot \
+            /home/vscode/.config/opencode /home/vscode/.local/share/opencode \
+            /home/vscode/.config/gh /data \
+            /home/vscode/.cache/uv /home/vscode/.cache/huggingface \
             /home/vscode/.cache/pnpm /home/vscode/.local/share/pnpm \
- && chown -R vscode:vscode /home/vscode \
- && sudo -u vscode -H env "PATH=$PATH" bash /opt/aidev/scripts/prewarm-lsp.sh || true
+ && chown -R vscode:vscode /home/vscode /data \
+ && sudo -u vscode -H env "PATH=$PATH" "DOTNET_ROOT=$DOTNET_ROOT" \
+        bash /opt/aidev/scripts/prewarm-lsp.sh || true
+
+# Chromium (+ headless shell) for the Playwright MCP — the only Playwright in
+# the image (no global `playwright` / `playwright-cli`; projects bring their own
+# @playwright/test or Microsoft.Playwright). Installed through the MCP's own
+# playwright-core so the revision matches, launch-tested (fails the build on a
+# missing shared library), and linked as /usr/local/bin/chromium, which
+# setup-agents passes to the MCP as --executable-path.
+RUN set -eux; \
+    install -d -o vscode -g vscode -m 0755 "$PLAYWRIGHT_BROWSERS_PATH"; \
+    sudo -u vscode -H env \
+        "PATH=$PATH" \
+        "PLAYWRIGHT_BROWSERS_PATH=$PLAYWRIGHT_BROWSERS_PATH" \
+        "PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=$PLAYWRIGHT_HOST_PLATFORM_OVERRIDE" \
+        bash /opt/aidev/scripts/playwright-browsers.sh install; \
+    test -x /usr/local/bin/chromium
+
+# aismartbuddy MCP (github.com/meghuizen/aismartbuddy) runs via uvx straight from
+# GitHub. Pre-resolve it into vscode's uv cache so the first MCP start is not a
+# ~30 s cold build (Codex gives MCP servers 10 s to start). ~/.cache/uv is a
+# named volume; a new volume is seeded from this layer. Best-effort: uvx
+# resolves `main` again at runtime, so a broken upstream must not block the image.
+RUN sudo -u vscode -H env "PATH=$PATH" \
+        "UV_PYTHON_DOWNLOADS=$UV_PYTHON_DOWNLOADS" "UV_PYTHON_PREFERENCE=$UV_PYTHON_PREFERENCE" \
+        uvx --from git+https://github.com/meghuizen/aismartbuddy aismartbuddy --help >/dev/null \
+    && echo "aismartbuddy: cached" \
+    || echo "WARNING: aismartbuddy could not be pre-resolved; uvx will retry at first start" >&2
 
 #-----------------------------------------------------------------------------
 # 16. Validation — fail loud if anything critical is missing
@@ -790,18 +931,19 @@ RUN set -eu; \
         fi; \
     fi
 
-RUN id mssql >/dev/null    || { echo "mssql user not created — mssql-server postinst failed" >&2; exit 1; } \
- && id postgres >/dev/null || { echo "postgres user not created — postgresql-18 postinst failed" >&2; exit 1; } \
- && test -x /usr/lib/postgresql/18/bin/postgres \
- && test -x /usr/local/bin/repo \
+RUN test -x /usr/local/bin/repo \
  && test -f /etc/security/limits.d/90-aidev.conf \
- && test -x /opt/mssql/bin/sqlservr \
- && test -x /opt/mssql-tools18/bin/sqlcmd \
  && test -x /usr/local/bin/dotnet \
+ && dotnet --list-sdks | grep -q '^10\.' \
+ && dotnet --list-sdks | grep -q '^11\.' \
  && test -x /usr/local/bin/uv \
  && test -x /usr/local/bin/rtk \
  && test -x /usr/local/bin/hermes \
- && test -x /usr/local/bin/yt-dlp \
+ && test -x /usr/local/bin/fff-mcp \
+ && test -x /usr/local/bin/sqlcmd \
+ && command -v psql  >/dev/null \
+ && command -v mysql >/dev/null \
+ && command -v yt-dlp >/dev/null \
  && test -x /usr/bin/node \
  && command -v npm    >/dev/null \
  && command -v pnpm   >/dev/null \
@@ -813,18 +955,73 @@ RUN id mssql >/dev/null    || { echo "mssql user not created — mssql-server po
  && command -v codex  >/dev/null \
  && command -v opencode >/dev/null \
  && command -v happy  >/dev/null \
- && command -v playwright >/dev/null \
- && command -v playwright-cli >/dev/null \
+ && command -v copilot >/dev/null \
+ && command -v codegraph >/dev/null \
+ && command -v playwright-mcp >/dev/null \
+ && command -v ng >/dev/null \
+ && command -v ngserver >/dev/null \
+ && command -v markdownlint-cli2 >/dev/null \
+ && command -v netcoredbg >/dev/null \
+ && command -v lldb >/dev/null \
+ && command -v pwsh >/dev/null \
+ && command -v hadolint >/dev/null \
+ && command -v markitdown >/dev/null \
+ && command -v semgrep >/dev/null \
+ && command -v pandoc >/dev/null \
+ && for c in "csharpier --version" "dotnet-ef --version" "dotnet-dump --version" \
+             "dotnet-trace --version" "dotnet-counters --version" "dotnet-gcdump --version" \
+             "dotnet-stack --version" "dotnet-sos --version" "ilspycmd --version" \
+             "dotnet-coverage --version" "reportgenerator -h" "docfx --version" \
+             "sqlpackage /version" "roslynator --version" "csharp-ls --version" \
+             "aspire --version" "dotnet-outdated --version" "dotnet-script --version" \
+             "netcoredbg --version" "pwsh -NoProfile -Command exit"; do \
+        timeout 120 $c >/dev/null 2>&1 || { echo "tool does not run: $c" >&2; exit 1; }; \
+    done \
  && /usr/bin/python3 -c "import sys; print(sys.version)" \
- && /usr/local/bin/python3.11 -c "import sys; assert sys.version_info[:2] == (3,11)" \
- && /usr/local/bin/python3.14 -c "import sys; assert sys.version_info[:2] == (3,14)" \
- && /opt/venv/bin/python -c "import huggingface_hub, docx, pptx, openpyxl, pypdf, duckdb, polars"
+ && /opt/venv/bin/python -c "import huggingface_hub, docx, pptx, openpyxl, pypdf, duckdb, polars" \
+ && { ! ls /usr/local/bin/python3.* >/dev/null 2>&1 \
+      || { echo "found a second python3.x in /usr/local/bin — the image ships ONE python" >&2; exit 1; }; }
 
 USER vscode
-WORKDIR /workspaces/aidevcontainer
+WORKDIR /data
 
 ENTRYPOINT ["/usr/local/bin/aidev-entrypoint"]
 CMD ["sleep", "infinity"]
+
+# Dev Container metadata baked into the image. VS Code / the devcontainer CLI
+# merge it with whichever .devcontainer/**/devcontainer.json is opened, so the
+# Docker and the podman variant share one extension list, port map and
+# post-create hook instead of two copies drifting apart.
+LABEL devcontainer.metadata='[{ \
+  "remoteUser": "vscode", \
+  "forwardPorts": [10000, 10001, 10002, 7071], \
+  "portsAttributes": { \
+    "10000": { "label": "Azurite Blob" }, \
+    "10001": { "label": "Azurite Queue" }, \
+    "10002": { "label": "Azurite Table" }, \
+    "7071":  { "label": "Azure Functions" } \
+  }, \
+  "postCreateCommand": "bash /opt/aidev/scripts/post-create.sh", \
+  "customizations": { "vscode": { \
+    "extensions": [ \
+      "ms-dotnettools.csharp", "ms-dotnettools.csdevkit", "ms-dotnettools.vscode-dotnet-runtime", \
+      "csharpier.csharpier-vscode", \
+      "angular.ng-template", "dbaeumer.vscode-eslint", "esbenp.prettier-vscode", \
+      "ms-playwright.playwright", \
+      "ms-azuretools.vscode-bicep", "ms-azuretools.vscode-azurefunctions", "ms-azuretools.vscode-docker", \
+      "ms-azure-devops.azure-pipelines", "github.vscode-github-actions", \
+      "ms-python.python", "ms-python.vscode-pylance", "charliermarsh.ruff", "astral-sh.uv", \
+      "anthropic.claude-code", "github.copilot-chat", \
+      "ast-grep.ast-grep-vscode", "tamasfe.even-better-toml", "redhat.vscode-yaml", \
+      "davidanson.vscode-markdownlint", "bierner.markdown-mermaid", "eamodio.gitlens" \
+    ], \
+    "settings": { \
+      "files.watcherExclude": { "**/bin/**": true, "**/obj/**": true, "**/node_modules/**": true, "**/.venv/**": true, "**/.angular/**": true }, \
+      "search.useRipgrep": true, \
+      "terminal.integrated.defaultProfile.linux": "bash" \
+    } \
+  } } \
+}]'
 
 LABEL org.opencontainers.image.title="ai-dev" \
       org.opencontainers.image.description="High-performance dev container for AI software development on Ubuntu 26.10 (amd64v3-optimized)" \

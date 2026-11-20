@@ -45,8 +45,23 @@ check "dotnet aspnetcore 11"    bash -c 'dotnet --list-runtimes | grep -q "Micro
 check "aspire cli"              aspire --version
 check "roslynator"              roslynator --version
 check "dotnet-ef"               dotnet-ef --version
-check "dotnet-format"           dotnet-format --version
+check "dotnet format (sdk)"     dotnet format --version
 check "csharp-ls"               csharp-ls --version
+check "csharpier"               csharpier --version
+check "dotnet-dump"             dotnet-dump --version
+check "dotnet-trace"            dotnet-trace --version
+check "dotnet-counters"         dotnet-counters --version
+check "dotnet-gcdump"           dotnet-gcdump --version
+check "dotnet-stack"            dotnet-stack --version
+check "dotnet-coverage"         dotnet-coverage --version
+check "reportgenerator"         bash -c 'reportgenerator -h 2>&1 | grep -qi reportgenerator'
+check "ilspycmd"                ilspycmd --version
+check "docfx"                   docfx --version
+check "sqlpackage"              bash -c 'sqlpackage /version 2>&1 | grep -qE "[0-9]+\."'
+check "netcoredbg"              netcoredbg --version
+check "lldb + SOS"              bash -c 'lldb --version && test -f ~/.lldbinit'
+check "pwsh"                    pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+
 
 echo "--- Azure ---"
 check "az cli"                  az version
@@ -57,18 +72,24 @@ check "func core tools"         func --version
 check "azurite"                 azurite --version
 
 echo "--- Node ---"
-check "node 26.6.x"             bash -c 'node --version | grep -qE "^v26\.6\."'
+check "node 26.x"               bash -c 'node --version | grep -qE "^v26\."'
 check "npm"                     npm --version
 check "pnpm (default pm)"       pnpm --version
 check "yarn"                    yarn --version
-check "playwright cli"          playwright --version
+check "playwright-mcp"          bash -c 'playwright-mcp --help'
+check "playwright mcp chromium" bash /opt/aidev/scripts/playwright-browsers.sh check
+check "playwright mcp -> chromium" bash -c 'claude mcp get playwright | grep -q -- "--caps vision,pdf,devtools.*--executable-path /usr/local/bin/chromium"'
+check "angular cli (ng)"        ng version
+check "angular language server" bash -c 'command -v ngserver'
+check "markdownlint-cli2"       bash -c 'markdownlint-cli2 --help'
+
 check "tsc"                     tsc --version
 check "typescript-language-srv" typescript-language-server --version
 
 echo "--- Python ---"
 check "system python3 (apt)"    bash -c 'python3 --version | grep -qE "^Python 3\.[0-9]+"'
-check "uv-managed python3.11"   bash -c 'python3.11 --version | grep -q "Python 3.11"'
-check "venv python"             bash -c '/opt/venv/bin/python --version | grep -qE "^Python 3\.[0-9]+"'
+check "venv uses system python" bash -c '[[ "$(/opt/venv/bin/python --version)" == "$(/usr/bin/python3 --version)" ]]'
+check "only one python"         bash -c '! ls /usr/local/bin/python3.* >/dev/null 2>&1 && [[ -z "$(ls -A "$HOME/.local/share/uv/python" 2>/dev/null)" ]]'
 check "uv"                      uv --version
 check "uvx"                     uvx --version
 check "ruff"                    ruff --version
@@ -76,6 +97,14 @@ check "pyright"                 pyright --version
 check "mypy"                    mypy --version
 
 echo "--- Search & nav ---"
+check "fff-mcp"                 fff-mcp --version
+check "fff indexes /data"       bash -c 'claude mcp get fff | grep -q -- "--no-update-check /data"'
+check "/data mounted"           test -d /data
+check "codegraph"               codegraph --version
+check "aismartbuddy (uvx)"      bash -c 'uvx --from git+https://github.com/meghuizen/aismartbuddy aismartbuddy --help'
+for s in fff codegraph playwright microsoft-learn aismartbuddy; do
+  check "claude mcp: $s"        claude mcp get "$s"
+done
 check "ripgrep (rg)"            rg --version
 check "ast-grep (sg)"           sg --version
 check "tree-sitter"             tree-sitter --version
@@ -99,16 +128,21 @@ check "rsync"                   rsync --version
 # it pulls in Debian's nodejs and ~150 node-* packages that NodeSource Node 26 then
 # removes, defeating the install.
 
-echo "--- DBs (clients) ---"
+echo "--- DB clients ---"
+check "sqlcmd (go-sqlcmd)"      sqlcmd --version
+check "psql"                    psql --version
+check "mysql client"            mysql --version
 check "duckdb"                  duckdb --version
-check "psql 18"                 bash -c 'psql --version | grep -q "psql .* 18"'
-check "sqlcmd"                  bash -c '/opt/mssql-tools18/bin/sqlcmd -? 2>&1 | head -n1 | grep -i sqlcmd'
 check "sqlite3"                 sqlite3 --version
 
 echo "--- AI / media ---"
 check "huggingface-cli"         huggingface-cli --help
 check "yt-dlp"                  yt-dlp --version
+check "yt-dlp js runtime=node"  grep -q -- "--js-runtimes node" /etc/yt-dlp.conf
 check "tesseract"               tesseract --version
+check "markitdown"              markitdown --help
+check "pandoc"                  pandoc --version
+check "graphviz (dot)"          dot -V
 check "ffmpeg"                  ffmpeg -version
 # Note: faster-whisper and whisper.cpp are NOT preinstalled. Install on demand:
 #   /opt/venv/bin/pip install faster-whisper
@@ -121,12 +155,22 @@ check "opencode"                opencode --version
 check "rtk"                     rtk --version
 check "hermes (NousResearch)"   bash -c 'hermes --version 2>/dev/null || hermes -v 2>/dev/null || command -v hermes'
 check "happy (engineering)"     bash -c 'happy --version 2>/dev/null || happy --help 2>/dev/null || command -v happy'
+check "copilot cli"             copilot --version
+check "claude config on volume" bash -c '[[ "$CLAUDE_CONFIG_DIR" == "$HOME/.claude" ]]'
 
 echo "--- Build agents (binaries present, not configured) ---"
 check "azp-agent run.sh"        test -x /opt/azp-agent/run.sh
 check "azp-agent config.sh"     test -x /opt/azp-agent/config.sh
 check "gh-runner run.sh"        test -x /opt/gh-runner/run.sh
 check "gh-runner config.sh"     test -x /opt/gh-runner/config.sh
+
+echo "--- Analysis / lint ---"
+check "shellcheck"              shellcheck --version
+check "hadolint"                hadolint --version
+check "semgrep"                 semgrep --version
+check "gitleaks"                gitleaks version
+check "yq"                      yq --version
+check "hyperfine"               hyperfine --version
 
 echo "--- Container / GPU ---"
 check "docker cli"              docker --version
@@ -143,13 +187,7 @@ check "py docx/openpyxl/pdf*"   /opt/venv/bin/python -c "import docx, pptx, open
 
 if [[ "${AIDEV_SMOKE_FULL:-0}" == "1" ]]; then
   echo "--- Services (full mode) ---"
-  bash scripts/start-mssql.sh
-  check "sqlcmd connect"        bash -c '/opt/mssql-tools18/bin/sqlcmd -S localhost,1433 -U sa -P "$(cat ~/.mssql-password)" -No -Q "SELECT @@VERSION"'
-
-  bash scripts/start-postgres.sh
-  check "psql connect"          bash -c 'psql -U postgres -h 127.0.0.1 -c "SELECT version();"'
-
-  bash scripts/start-azurite.sh
+  bash /opt/aidev/scripts/start-azurite.sh
   check "azurite blob"          curl -fsS "http://127.0.0.1:10000/devstoreaccount1?comp=list"
 fi
 
