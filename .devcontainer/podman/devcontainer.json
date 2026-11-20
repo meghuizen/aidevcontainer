@@ -1,0 +1,14 @@
+{
+  "$schema": "https://raw.githubusercontent.com/devcontainers/spec/main/schemas/devContainer.schema.json",
+  // Rootless podman. Needs in VS Code user settings:
+  //   "dev.containers.dockerPath": "podman",
+  //   "dev.containers.dockerComposePath": "podman-compose"
+  // and the podman API socket running on the host:
+  //   systemctl --user enable --now podman.socket
+  // Everything else comes from the image's `devcontainer.metadata` label.
+  "name": "ai-dev (podman)",
+  "dockerComposeFile": ["../docker-compose.yml", "../docker-compose.podman.yml"],
+  "service": "dev",
+  // The data folder (all repos) is mounted at /data — see docker-compose.yml.
+  "workspaceFolder": "/data/${localWorkspaceFolderBasename}"
+}

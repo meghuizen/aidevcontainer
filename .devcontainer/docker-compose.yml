@@ -9,9 +9,11 @@ services:
       # NODE_MAJOR, NODE_VERSION) stays at its Dockerfile ARG default so there is
       # one place to bump it.
       args:
-        GH_RUNNER_VERSION: "2.336.0"
-        AZP_AGENT_VERSION: "5.277.0"
+        GH_RUNNER_VERSION: "2.338.2"
+        AZP_AGENT_VERSION: "5.282.0"
         RTK_VERSION: ""
+        FFF_VERSION: ""
+        SQLCMD_VERSION: ""
         # x86-64-v3 optimized Ubuntu packages (AVX2/FMA/BMI2).
         # Set to "0" if this image must run on a pre-2013 CPU.
         ENABLE_AMD64V3: "1"
@@ -37,8 +39,7 @@ services:
     sysctls:
       net.core.somaxconn: "8192"
       net.ipv4.ip_local_port_range: "10240 65535"
-    # /dev/shm default is 64 MB, which Chromium (Playwright) and SQL Server both
-    # outgrow — Chromium crashes, SQL Server logs shared-memory errors.
+    # /dev/shm default is 64 MB, which Chromium (Playwright) outgrows and crashes on.
     shm_size: "2gb"
     environment:
       TZ: Europe/Brussels
@@ -53,16 +54,26 @@ services:
     #           count: all
     #           capabilities: [gpu]
     volumes:
-      - ../:/workspaces/aidevcontainer:cached
+      # The data folder: where all source code and the working environment live.
+      # Default = the folder that CONTAINS this repo (e.g. ~/Projects), so every
+      # sibling repo is available and fff-mcp indexes all of it. Override with
+      # AIDEV_DATA_DIR=/path/to/projects — it must contain this repo, because the
+      # devcontainer opens /data/<this repo's folder name>.
+      - ${AIDEV_DATA_DIR:-../..}:/data:cached
       - /var/run/docker.sock:/var/run/docker.sock
-      - mssql-data:/var/opt/mssql
-      - pg-data:/var/lib/postgresql/18/main
       - uv-cache:/home/vscode/.cache/uv
       - nuget-cache:/home/vscode/.nuget
       - npm-cache:/home/vscode/.npm
       - pnpm-store:/home/vscode/.cache/pnpm
       - hf-cache:/home/vscode/.cache/huggingface
+      # Agent config + auth. CLAUDE_CONFIG_DIR puts ~/.claude.json inside
+      # ~/.claude, so one volume keeps Claude Code logged in across rebuilds.
       - claude-config:/home/vscode/.claude
+      - codex-home:/home/vscode/.codex
+      - copilot-home:/home/vscode/.copilot
+      - opencode-config:/home/vscode/.config/opencode
+      - opencode-data:/home/vscode/.local/share/opencode
+      - gh-config:/home/vscode/.config/gh
       - azure-config:/home/vscode/.azure
       # tmpfs long-form: short-form `- /tmp:size=4g,exec` is parsed as a literal path
       # by compose; long-form is the only way to set size.
@@ -73,12 +84,15 @@ services:
     command: ["sleep", "infinity"]
 
 volumes:
-  mssql-data:
-  pg-data:
   uv-cache:
   nuget-cache:
   npm-cache:
   pnpm-store:
   hf-cache:
   claude-config:
+  codex-home:
+  copilot-home:
+  opencode-config:
+  opencode-data:
+  gh-config:
   azure-config:

@@ -1,0 +1,65 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__fff__*",
+      "mcp__codegraph__*",
+      "mcp__microsoft-learn__*",
+      "mcp__playwright__*",
+      "mcp__aismartbuddy__*",
+      "Bash(dotnet build:*)",
+      "Bash(dotnet test:*)",
+      "Bash(dotnet restore:*)",
+      "Bash(dotnet format:*)",
+      "Bash(dotnet list:*)",
+      "Bash(dotnet --info)",
+      "Bash(dotnet --list-sdks)",
+      "Bash(dotnet csharpier:*)",
+      "Bash(csharpier:*)",
+      "Bash(dotnet ef migrations list:*)",
+      "Bash(dotnet outdated:*)",
+      "Bash(dotnet-counters list:*)",
+      "Bash(dotnet-trace ps:*)",
+      "Bash(dotnet-dump ps:*)",
+      "Bash(aspire --version)",
+      "Bash(pnpm install:*)",
+      "Bash(pnpm build:*)",
+      "Bash(pnpm test:*)",
+      "Bash(pnpm lint:*)",
+      "Bash(pnpm run:*)",
+      "Bash(pnpm list:*)",
+      "Bash(pnpm why:*)",
+      "Bash(ng build:*)",
+      "Bash(ng test:*)",
+      "Bash(ng lint:*)",
+      "Bash(ng version)",
+      "Bash(npx tsc:*)",
+      "Bash(docker ps:*)",
+      "Bash(docker images:*)",
+      "Bash(docker logs:*)",
+      "Bash(docker inspect:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git branch:*)",
+      "Bash(rg:*)",
+      "Bash(fd:*)",
+      "Bash(codegraph:*)",
+      "Bash(markitdown:*)",
+      "Bash(shellcheck:*)",
+      "Bash(hadolint:*)"
+    ]
+  },
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "codegraph prompt-hook"
+          }
+        ]
+      }
+    ]
+  }
+}

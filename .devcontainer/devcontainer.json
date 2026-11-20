@@ -1,56 +1,12 @@
 {
   "$schema": "https://raw.githubusercontent.com/devcontainers/spec/main/schemas/devContainer.schema.json",
-  "name": "ai-dev",
+  // Docker (Docker Desktop / Docker Engine). For rootless podman use
+  // .devcontainer/podman/devcontainer.json instead.
+  // Extensions, ports, remoteUser and postCreateCommand come from the image's
+  // `devcontainer.metadata` label (see Dockerfile) — keep this file thin.
+  "name": "ai-dev (docker)",
   "dockerComposeFile": "docker-compose.yml",
   "service": "dev",
-  "workspaceFolder": "/workspaces/aidevcontainer",
-  "remoteUser": "vscode",
-  "containerEnv": {
-    "TZ": "Europe/Brussels"
-  },
-  "forwardPorts": [1433, 5432, 10000, 10001, 10002, 7071],
-  "portsAttributes": {
-    "1433":  { "label": "SQL Server 2025" },
-    "5432":  { "label": "PostgreSQL 18" },
-    "10000": { "label": "Azurite Blob" },
-    "10001": { "label": "Azurite Queue" },
-    "10002": { "label": "Azurite Table" },
-    "7071":  { "label": "Azure Functions" }
-  },
-  "customizations": {
-    "vscode": {
-      "extensions": [
-        "ms-dotnettools.csharp",
-        "ms-dotnettools.csdevkit",
-        "ms-dotnettools.dotnet-runtime",
-        "ms-azuretools.vscode-bicep",
-        "ms-azuretools.vscode-azurefunctions",
-        "ms-azuretools.vscode-docker",
-        "ms-vscode.azure-account",
-        "ms-azure-devops.azure-pipelines",
-        "ms-python.python",
-        "ms-python.vscode-pylance",
-        "charliermarsh.ruff",
-        "astral-sh.uv",
-        "anthropic.claude-code",
-        "ast-grep.ast-grep-vscode",
-        "tamasfe.even-better-toml",
-        "redhat.vscode-yaml",
-        "eamodio.gitlens",
-        "github.vscode-github-actions",
-        "github.copilot-chat"
-      ],
-      "settings": {
-        "files.watcherExclude": {
-          "**/bin/**": true,
-          "**/obj/**": true,
-          "**/node_modules/**": true,
-          "**/.venv/**": true
-        },
-        "search.useRipgrep": true,
-        "terminal.integrated.defaultProfile.linux": "bash"
-      }
-    }
-  },
-  "postCreateCommand": "bash .devcontainer/post-create.sh"
+  // The data folder (all repos) is mounted at /data — see docker-compose.yml.
+  "workspaceFolder": "/data/${localWorkspaceFolderBasename}"
 }
